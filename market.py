@@ -1,18 +1,21 @@
 """Сбор рыночных данных для AI-аналитика.
 
-Бесплатные источники, ключи не нужны:
-  * стакан и свечи    — Binance, запасной вариант Bybit
-  * OI и funding      — Binance Futures, запасной Bybit
-  * лонг/шорт ратио   — Binance Futures, запасной OKX
-  * новости           — RSS CoinDesk + Cointelegraph
+Бесплатные источники, ключи не нужны. У каждого блока своя цепочка
+из нескольких бирж — побеждает первая, кто ответил:
 
-Binance блокирует часть регионов (в том числе IP некоторых хостингов),
-поэтому у каждого рыночного блока есть запасная биржа: первый источник,
-который ответил, и становится источником блока.
+  стакан и свечи   Binance → Bybit → MEXC → OKX
+  OI и funding     Binance → Bybit → OKX
+  лонг/шорт        Binance → OKX
+  новости          RSS CoinDesk + Cointelegraph
 
-Недоступный источник попадает в контекст вместе с текстом ошибки и не
-роняет весь анализ. Базовые адреса можно переопределить переменными
-BINANCE_SPOT / BINANCE_FUT / BYBIT / OKX — так удобно проверять падение.
+Зачем столько: Binance отдаёт 451 (геоблок) с IP США, а Bybit с США
+тоже не работает — на хостинге это выглядело как «доступны только
+новости». MEXC и OKX в США отвечают. Победивший источник попадает в
+контекст, проигравшие — в словарь ошибок с текстом причины.
+
+Ни один упавший источник не роняет весь анализ. Базовые адреса
+переопределяются переменными BINANCE_SPOT / BINANCE_FUT / BYBIT /
+MEXC_SPOT / OKX — так удобно эмулировать блокировку.
 """
 
 import asyncio
@@ -26,6 +29,7 @@ TIMEOUT = aiohttp.ClientTimeout(total=8)
 BINANCE_SPOT = os.getenv("BINANCE_SPOT", "https://api.binance.com")
 BINANCE_FUT = os.getenv("BINANCE_FUT", "https://fapi.binance.com")
 BYBIT = os.getenv("BYBIT", "https://api.bybit.com")
+MEXC_SPOT = os.getenv("MEXC_SPOT", "https://api.mexc.com")
 OKX = os.getenv("OKX", "https://www.okx.com")
 
 NEWS_FEEDS = (
@@ -34,8 +38,15 @@ NEWS_FEEDS = (
 )
 HEADERS = {"User-Agent": "crypto-bot/1.0"}
 
-KLINE_LIMIT = 300          # больше 200 — нужен EMA200
-BYBIT_INTERVAL = {"15m": "15", "1h": "60"}
+KLINE_LIMIT = 300          # нужно 200+ — иначе не посчитается EMA200
+
+# Формат интервалов у каждой биржи свой: MEXC пишет "60m", OKX — "1H".
+INTERVALS = {
+    "binance": {"15m": "15m", "1h": "1h"},
+    "bybit": {"15m": "15", "1h": "60"},
+    "mexc": {"15m": "15m", "1h": "60m"},
+    "okx": {"15m": "15m", "1h": "1H"},
+}
 
 
 async def _get_json(session, url, params=None):
@@ -47,8 +58,9 @@ async def _get_json(session, url, params=None):
 async def _with_fallback(providers):
     """Пробует источники по очереди. Побеждает первый, кто ответил.
 
-    Каждый provider — корутина, возвращающая словарь. При неудаче
-    ошибка запоминается, чтобы её можно было показать в логах.
+    Каждый provider — корутина, возвращающая словарь. Проигравшие
+    источники складываются в error с разделителем " | ", чтобы текст
+    можно было разбить обратно на строки при показе причины.
     """
     errors = {}
     for name, factory in providers:
@@ -61,7 +73,7 @@ async def _with_fallback(providers):
         except Exception as exc:  # noqa: BLE001 - источник не должен ронять анализ
             errors[name] = f"{type(exc).__name__}: {exc}"
 
-    return {"error": "; ".join(f"{name}: {err}" for name, err in errors.items())}
+    return {"error": " | ".join(f"{name}: {err}" for name, err in errors.items())}
 
 
 def _check_bybit(data):
@@ -74,6 +86,13 @@ def _check_okx(data):
     if str(data.get("code")) != "0":
         raise ValueError(f"code {data.get('code')}: {data.get('msg')}")
     return data.get("data") or []
+
+
+def _okx_inst(symbol):
+    """BTCUSDT → BTC-USDT (формат инструмента OKX)."""
+    if symbol.endswith("USDT"):
+        return f"{symbol[:-4]}-USDT"
+    return symbol
 
 
 # --- Индикаторы (считаются локально, без внешних сервисов) ---------------
@@ -123,14 +142,19 @@ def _atr(highs, lows, closes, period=14):
 
 # --- Стакан ---------------------------------------------------------------
 
-async def _binance_depth(session, symbol, limit):
-    data = await _get_json(
-        session, f"{BINANCE_SPOT}/api/v3/depth", {"symbol": symbol, "limit": limit}
-    )
-    return {
-        "bids": [(float(p), float(q)) for p, q in data.get("bids", [])],
-        "asks": [(float(p), float(q)) for p, q in data.get("asks", [])],
-    }
+def _spot_depth(base):
+    """Binance и MEXC отдают стакан в одинаковом формате /api/v3/depth."""
+
+    async def fetch(session, symbol, limit):
+        data = await _get_json(
+            session, f"{base}/api/v3/depth", {"symbol": symbol, "limit": limit}
+        )
+        return {
+            "bids": [(float(p), float(q)) for p, q in data.get("bids", [])],
+            "asks": [(float(p), float(q)) for p, q in data.get("asks", [])],
+        }
+
+    return fetch
 
 
 async def _bybit_depth(session, symbol, limit):
@@ -146,12 +170,35 @@ async def _bybit_depth(session, symbol, limit):
     }
 
 
+async def _okx_books(session, symbol, limit):
+    data = await _get_json(
+        session,
+        f"{OKX}/api/v5/market/books",
+        {"instId": _okx_inst(symbol), "sz": min(limit, 400)},
+    )
+    rows = _check_okx(data)
+    if not rows:
+        raise ValueError("OKX не вернул стакан")
+    book = rows[0]
+    # У OKX в заявке 4 поля: цена, объём, ликвидации, число ордеров.
+    return {
+        "bids": [(float(row[0]), float(row[1])) for row in book.get("bids", [])],
+        "asks": [(float(row[0]), float(row[1])) for row in book.get("asks", [])],
+    }
+
+
+BINANCE_DEPTH = _spot_depth(BINANCE_SPOT)
+MEXC_DEPTH = _spot_depth(MEXC_SPOT)
+
+
 async def get_orderbook(session, symbol, limit=50, top=20, wall_usd=1_000_000):
     """Стакан: суммарный объём сторон, дисбаланс, крупные стенки."""
     raw = await _with_fallback(
         [
-            ("binance", lambda: _binance_depth(session, symbol, limit)),
+            ("binance", lambda: BINANCE_DEPTH(session, symbol, limit)),
             ("bybit", lambda: _bybit_depth(session, symbol, limit)),
+            ("mexc", lambda: MEXC_DEPTH(session, symbol, limit)),
+            ("okx", lambda: _okx_books(session, symbol, limit)),
         ]
     )
     if "error" in raw:
@@ -206,11 +253,36 @@ async def _bybit_derivatives(session, symbol):
     if not rows:
         raise ValueError("Bybit не вернул тикер")
     row = rows[0]
-    mark_price = float(row.get("markPrice") or row["lastPrice"])
     return {
         "oi_btc": round(float(row["openInterest"]), 2),
         "oi_usd": round(float(row.get("openInterestValue") or 0)),
         "funding_pct": round(float(row["fundingRate"]) * 100, 5),
+        "mark_price": float(row.get("markPrice") or row["lastPrice"]),
+    }
+
+
+async def _okx_derivatives(session, symbol):
+    inst_id = f"{_okx_inst(symbol)}-SWAP"
+    funding = await _get_json(
+        session, f"{OKX}/api/v5/public/funding-rate", {"instId": inst_id}
+    )
+    interest = await _get_json(
+        session, f"{OKX}/api/v5/public/open-interest", {"instId": inst_id}
+    )
+    funding_rows, oi_rows = _check_okx(funding), _check_okx(interest)
+    if not funding_rows or not oi_rows:
+        raise ValueError("OKX не вернул funding/open interest")
+
+    rate, oi = funding_rows[0], oi_rows[0]
+    oi_btc = float(oi["oiCcy"])
+    oi_usd = float(oi.get("oiUsd") or 0)
+    mark_price = float(rate.get("markPrice") or 0) or (oi_usd / oi_btc if oi_btc else 0.0)
+    if not oi_usd and mark_price:
+        oi_usd = oi_btc * mark_price
+    return {
+        "oi_btc": round(oi_btc, 2),
+        "oi_usd": round(oi_usd),
+        "funding_pct": round(float(rate["fundingRate"]) * 100, 5),
         "mark_price": mark_price,
     }
 
@@ -254,12 +326,15 @@ async def get_derivatives(session, symbol):
         [
             ("binance", lambda: _binance_derivatives(session, symbol)),
             ("bybit", lambda: _bybit_derivatives(session, symbol)),
+            ("okx", lambda: _okx_derivatives(session, symbol)),
         ]
     )
     if "error" in out:
         return out
 
-    ls = await _with_fallback([("binance", lambda: _binance_ls(session, symbol)), ("okx", _okx_ls)])
+    ls = await _with_fallback(
+        [("binance", lambda: _binance_ls(session, symbol)), ("okx", _okx_ls)]
+    )
     if "error" in ls:
         out["ls_error"] = ls["error"]
     else:
@@ -271,13 +346,18 @@ async def get_derivatives(session, symbol):
 
 # --- Свечи и индикаторы ---------------------------------------------------
 
-async def _binance_klines(session, symbol, interval, limit):
-    rows = await _get_json(
-        session,
-        f"{BINANCE_SPOT}/api/v3/klines",
-        {"symbol": symbol, "interval": interval, "limit": limit},
-    )
-    return {"candles": [(float(r[2]), float(r[3]), float(r[4])) for r in rows]}
+def _spot_klines(base, intervals):
+    """Binance и MEXC отдают свечи одинаково, различается только интервал."""
+
+    async def fetch(session, symbol, interval, limit):
+        data = await _get_json(
+            session,
+            f"{base}/api/v3/klines",
+            {"symbol": symbol, "interval": intervals[interval], "limit": limit},
+        )
+        return {"candles": [(float(r[2]), float(r[3]), float(r[4])) for r in data]}
+
+    return fetch
 
 
 async def _bybit_klines(session, symbol, interval, limit):
@@ -287,7 +367,7 @@ async def _bybit_klines(session, symbol, interval, limit):
         {
             "category": "spot",
             "symbol": symbol,
-            "interval": BYBIT_INTERVAL[interval],
+            "interval": INTERVALS["bybit"][interval],
             "limit": limit,
         },
     )
@@ -299,6 +379,28 @@ async def _bybit_klines(session, symbol, interval, limit):
     return {"candles": [(float(r[2]), float(r[3]), float(r[4])) for r in rows]}
 
 
+async def _okx_klines(session, symbol, interval, limit):
+    data = await _get_json(
+        session,
+        f"{OKX}/api/v5/market/candles",
+        {
+            "instId": _okx_inst(symbol),
+            "bar": INTERVALS["okx"][interval],
+            "limit": min(limit, 300),
+        },
+    )
+    rows = _check_okx(data)
+    if not rows:
+        raise ValueError("OKX не вернул свечи")
+    # OKX тоже отдаёт новые свечи первыми.
+    rows = list(reversed(rows))
+    return {"candles": [(float(r[2]), float(r[3]), float(r[4])) for r in rows]}
+
+
+BINANCE_KLINES = _spot_klines(BINANCE_SPOT, INTERVALS["binance"])
+MEXC_KLINES = _spot_klines(MEXC_SPOT, INTERVALS["mexc"])
+
+
 async def get_indicators(session, symbol, limit=KLINE_LIMIT):
     """EMA 20/50/200, RSI(14), ATR(14) на 15m и 1h. Считается локально."""
     out, failures = {}, {}
@@ -306,8 +408,10 @@ async def get_indicators(session, symbol, limit=KLINE_LIMIT):
     for interval in ("15m", "1h"):
         data = await _with_fallback(
             [
-                ("binance", lambda: _binance_klines(session, symbol, interval, limit)),
+                ("binance", lambda: BINANCE_KLINES(session, symbol, interval, limit)),
                 ("bybit", lambda: _bybit_klines(session, symbol, interval, limit)),
+                ("mexc", lambda: MEXC_KLINES(session, symbol, interval, limit)),
+                ("okx", lambda: _okx_klines(session, symbol, interval, limit)),
             ]
         )
         if "error" in data:
@@ -334,7 +438,7 @@ async def get_indicators(session, symbol, limit=KLINE_LIMIT):
         }
 
     if not out:
-        return {"error": "; ".join(f"{k}: {v}" for k, v in failures.items())}
+        return {"error": " | ".join(f"{k}: {v}" for k, v in failures.items())}
     if failures:
         out["partial"] = failures
     return out
@@ -469,8 +573,8 @@ async def build_market_context(symbol="BTC/USDT"):
     if "technicals" in available:
         for interval, label in (("15m", "15 минут"), ("1h", "1 час")):
             block = blocks["technicals"].get(interval, {})
-            if "error" in block or "close" not in block:
-                reason = block.get("error") or blocks["technicals"].get("partial", {})
+            if "close" not in block:
+                reason = blocks["technicals"].get("partial", {}).get(interval, "")
                 lines.append(f"{label}: unavailable ({reason})")
                 continue
             lines.append(

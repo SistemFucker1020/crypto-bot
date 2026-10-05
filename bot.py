@@ -309,10 +309,12 @@ def data_report(context: dict) -> str:
     """Честный ответ, почему сигнала нет, вместо запроса к модели."""
     working = [FACTOR_NAMES[name] for name in context["available"]]
     broken = [FACTOR_NAMES[name] for name in context["errors"]]
-    detail = "\n".join(
-        f"{FACTOR_NAMES[name]}: {reason[:140]}"
-        for name, reason in context["errors"].items()
-    )
+    detail_lines = []
+    for name, reason in context["errors"].items():
+        detail_lines.append(f"{FACTOR_NAMES[name]}:")
+        for part in str(reason).split(" | "):
+            detail_lines.append(f"  • {part[:170]}")
+    detail = "\n".join(detail_lines)
     return (
         "❌ Недостаточно данных для сигнала.\n\n"
         f"Работают: {', '.join(working) or 'ничего'}\n"
