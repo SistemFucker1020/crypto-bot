@@ -53,7 +53,7 @@ async def predict_cmd(message: Message):
 
         await msg.edit_text("🧠 Анализирую данные с помощью Qwen 2.5...")
         response = await groq_client.chat.completions.create(
-            model="qwen-2.5-32b",
+            model="llama-3.3-70b-versatile",  # <--- Заменили модель
             messages=[{"role": "user", "content": prompt}]
         )
         await msg.edit_text(response.choices[0].message.content)
