@@ -36,7 +36,6 @@ async def start_cmd(message: Message):
 async def predict_cmd(message: Message):
     msg = await message.answer("📊 Получаю данные с биржи MEXC...")
     try:
-        # MEXC отлично работает на датацентровых IP Render без CloudFront-блоков
         exchange = ccxt.mexc()
         ticker = await exchange.fetch_ticker('BTC/USDT')
         await exchange.close()
@@ -51,9 +50,9 @@ async def predict_cmd(message: Message):
         Дай краткий прогноз и торговую рекомендацию (Long/Short/Wait).
         """
 
-        await msg.edit_text("🧠 Анализирую данные с помощью Qwen 2.5...")
+        await msg.edit_text("🧠 Анализирую данные через Groq...")
         response = await groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",  # <--- Заменили модель
+            model="llama3-70b-8192",
             messages=[{"role": "user", "content": prompt}]
         )
         await msg.edit_text(response.choices[0].message.content)
