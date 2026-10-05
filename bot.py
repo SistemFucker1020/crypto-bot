@@ -50,15 +50,14 @@ async def predict_cmd(message: Message):
         Дай краткий прогноз и торговую рекомендацию (Long/Short/Wait).
         """
 
-        await msg.edit_text("🧠 Анализирую данные через Groq...")
+        await msg.edit_text("🧠 Анализирую данные через Groq (Llama 3.1)...")
         response = await groq_client.chat.completions.create(
-            model="llama3-70b-8192",
+            model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}]
         )
         await msg.edit_text(response.choices[0].message.content)
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {str(e)}")
-
 async def main():
     await start_web_server()
     print("🚀 Бот и веб-сервер успешно запущены!")
