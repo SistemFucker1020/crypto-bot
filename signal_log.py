@@ -116,6 +116,45 @@ def total() -> int:
         return conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
 
 
+_CHATS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chats (
+    chat_id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL
+)
+"""
+
+
+def save_chat(chat_id) -> None:
+    """Запоминает чат, куда можно слать автосигналы. Повтор — не ошибка."""
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+        conn.execute(_CHATS_SCHEMA)
+        conn.execute(
+            "INSERT OR IGNORE INTO chats (chat_id, created_at) VALUES (?, ?)",
+            (int(chat_id), now_iso()),
+        )
+        conn.commit()
+
+
+def chats() -> list:
+    """Чаты, куда рассылать автопроверку."""
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+        conn.execute(_CHATS_SCHEMA)
+        rows = conn.execute("SELECT chat_id FROM chats ORDER BY chat_id").fetchall()
+    return [row[0] for row in rows]
+
+
+def last_signal_direction():
+    """Направление последнего LONG/SHORT — чтобы не слать дубль после рестарта."""
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+        conn.execute(_SCHEMA)
+        row = conn.execute(
+            "SELECT direction FROM signals "
+            "WHERE direction IN ('LONG', 'SHORT') "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return row[0] if row else None
+
+
 def stats() -> dict:
     """Сводка по сигналам: сколько сделок, средний профит, доля прибыльных."""
     with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:

@@ -1,7 +1,9 @@
 import os
 import json
+import time
 import asyncio
 import logging
+from datetime import datetime, timedelta
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher
@@ -43,6 +45,13 @@ MAX_LEVERAGE = 10.0               # потолок плеча (правило: �
 LEVERAGE_LADDER = (1.0, 2.0, 3.0, 5.0, 10.0)
 MIN_ATR_PCT = 0.05                # ниже — волатильности нет, сидим на руках
 REQUIRED_FACTORS = 3              # конфлюэнция: минимум подтверждённых факторов
+
+# Автопроверка: раз в CHECK_INTERVAL_MIN минут, через CHECK_DELAY_SEC после
+# закрытия свечи соответствующего таймфрейма. 0 — автопроверка выключена.
+CHECK_INTERVAL_MIN = int(os.getenv("CHECK_INTERVAL_MIN", "15"))
+CHECK_DELAY_SEC = int(os.getenv("CHECK_DELAY_SEC", "45"))
+REPEAT_SIGNAL_SEC = 3600          # тот же сигнал вспоминаем не чаще раза в час
+AUTO_FAILURE_ALERT = 4            # предупредить после N подряд неудачных проверок
 
 GROQ_MODEL = "openai/gpt-oss-120b"
 SYMBOL = "BTC/USDT"
@@ -456,6 +465,7 @@ async def safe_edit(message: Message, text: str) -> None:
 
 @dp.message(Command("start"))
 async def start_cmd(message: Message):
+    remember(message)
     percent = risk_percent(BALANCE)
     await message.answer(
         "👋 Привет! Я крипто-аналитик.\n"
@@ -470,16 +480,40 @@ async def start_cmd(message: Message):
     )
 
 
-@dp.message(Command("predict"))
-async def predict_cmd(message: Message):
-    msg = await message.answer("📊 Собираю данные: стакан, деривативы, индикаторы, новости...")
+def remember(message: Message) -> None:
+    """Запоминает чат — без этого автопроверке некому будет писать."""
+    try:
+        signal_log.save_chat(message.chat.id)
+    except Exception:  # noqa: BLE001
+        log.exception("не удалось запомнить чат")
 
+
+async def analyze(progress=None) -> dict:
+    """Полный проход: данные рынка → модель → расчёт риска.
+
+    Один и тот же код идут вручную (/predict) и по расписанию.
+    progress — необязательный колбэк для промежуточных статусов,
+    в фоновом режиме его не передают.
+
+    Возвращает:
+      kind   — signal | wait | nodata | data_error | groq_error | parse_error
+      text   — готовое сообщение для пользователя
+      trade  — расчёт (для лога)
+      context, raw — контекст рынка и сырой ответ модели (для лога)
+    """
     try:
         context = await build_market_context(SYMBOL)
     except Exception as exc:  # noqa: BLE001
         log.exception("не удалось собрать рыночные данные")
-        await safe_edit(msg, f"❌ Не удалось собрать рыночные данные:\n{exc}")
-        return
+        trade = {"direction": "DATA_ERROR", "reason": str(exc)}
+        log_signal(trade, {})
+        return {
+            "kind": "data_error",
+            "text": f"❌ Не удалось собрать рыночные данные:\n{exc}",
+            "trade": trade,
+            "context": {},
+            "raw": "",
+        }
 
     log.info(
         "факторы: %s | ошибки: %s",
@@ -489,11 +523,18 @@ async def predict_cmd(message: Message):
 
     if len(context["available"]) < REQUIRED_FACTORS:
         # Без 3 источников сигнал невозможен — не тратим запрос к модели впустую.
-        await safe_edit(msg, data_report(context))
-        log_signal(no_data_trade(context), context)
-        return
+        trade = no_data_trade(context)
+        log_signal(trade, context)
+        return {
+            "kind": "nodata",
+            "text": data_report(context),
+            "trade": trade,
+            "context": context,
+            "raw": "",
+        }
 
-    await safe_edit(msg, f"🧠 Анализирую через {GROQ_MODEL}...")
+    if progress:
+        await progress(f"🧠 Анализирую через {GROQ_MODEL}...")
 
     try:
         response = await groq_client.chat.completions.create(
@@ -508,9 +549,15 @@ async def predict_cmd(message: Message):
         raw = response.choices[0].message.content or ""
     except Exception as exc:  # noqa: BLE001
         log.exception("не удалось вызвать нейросеть")
-        await safe_edit(msg, f"❌ Ошибка вызова нейросети:\n{exc}")
-        log_signal({"direction": "GROQ_ERROR", "reason": str(exc)}, context)
-        return
+        trade = {"direction": "GROQ_ERROR", "reason": str(exc)}
+        log_signal(trade, context)
+        return {
+            "kind": "groq_error",
+            "text": f"❌ Ошибка вызова нейросети:\n{exc}",
+            "trade": trade,
+            "context": context,
+            "raw": "",
+        }
 
     try:
         setup = parse_setup(raw)
@@ -518,17 +565,46 @@ async def predict_cmd(message: Message):
         trade = build_trade(setup, context["available"], BALANCE)
     except (ValueError, json.JSONDecodeError) as exc:
         log.warning("не удалось разобрать ответ модели: %s | raw=%s", exc, raw)
-        await safe_edit(msg, f"❌ Модель ответила не по формату: {exc}")
-        log_signal({"direction": "PARSE_ERROR", "reason": str(exc)}, context, raw)
-        return
+        trade = {"direction": "PARSE_ERROR", "reason": str(exc)}
+        log_signal(trade, context, raw)
+        return {
+            "kind": "parse_error",
+            "text": f"❌ Модель ответила не по формату: {exc}",
+            "trade": trade,
+            "context": context,
+            "raw": raw,
+        }
 
     log_signal(trade, context, raw)
-    await safe_edit(msg, format_trade(trade))
+    kind = "signal" if trade["direction"] in ("LONG", "SHORT") else "wait"
+    return {
+        "kind": kind,
+        "text": format_trade(trade),
+        "trade": trade,
+        "context": context,
+        "raw": raw,
+    }
+
+
+@dp.message(Command("predict"))
+async def predict_cmd(message: Message):
+    remember(message)
+    msg = await message.answer("📊 Собираю данные: стакан, деривативы, индикаторы, новости...")
+
+    async def progress(text: str) -> None:
+        await safe_edit(msg, text)
+
+    result = await analyze(progress)
+    if result["kind"] == "signal":
+        # Пользователь уже увидел сигнал — фоновой задаче дублировать его не нужно.
+        note_sent(result["trade"]["direction"])
+    await safe_edit(msg, result["text"])
 
 
 @dp.message(Command("history"))
 async def history_cmd(message: Message):
     """Последние записи из лога сигналов."""
+    remember(message)
     try:
         rows = signal_log.recent(8)
         total = signal_log.total()
@@ -547,6 +623,7 @@ async def history_cmd(message: Message):
 @dp.message(Command("stats"))
 async def stats_cmd(message: Message):
     """Сводка для анализа paper trading."""
+    remember(message)
     try:
         data = signal_log.stats()
     except Exception as exc:  # noqa: BLE001
@@ -576,14 +653,132 @@ async def stats_cmd(message: Message):
     )
 
 
+# --- Автопроверка по расписанию -----------------------------------------
+_auto = {
+    "direction": None,   # напр. последний отправленный сигнал
+    "sent_at": 0.0,      # monotonic-время отправки (анти-спам)
+    "failures": 0,       # подряд неудачных проверок
+    "alerted": False,     # предупреждение об отказе уже уходило
+}
+_background_tasks: set = set()
+
+
+def note_sent(direction: str) -> None:
+    """Помечает, что сигнал уже показан — чтобы фоновая задача не дублировала."""
+    _auto["direction"] = direction
+    _auto["sent_at"] = time.monotonic()
+
+
+def seed_auto_state() -> None:
+    """После рестарта не повторяет сигнал, который уже был в логе."""
+    try:
+        direction = signal_log.last_signal_direction()
+    except Exception:  # noqa: BLE001
+        log.exception("не удалось прочитать последний сигнал из лога")
+        return
+    if direction:
+        # Время считаем «сейчас»: после перезапуска дубль не нужен.
+        note_sent(direction)
+
+
+def seconds_until_next_check(moment=None) -> float:
+    """Ждём границу интервала плюс задержку — свеча должна закрыться.
+
+    Интервал 15 → проверки в 21:15:45, 21:30:45, 21:45:45.
+    """
+    now = moment or datetime.now().astimezone()
+    interval = max(CHECK_INTERVAL_MIN, 1)
+    base = now.replace(minute=(now.minute // interval) * interval, second=0, microsecond=0)
+    candidate = base + timedelta(seconds=CHECK_DELAY_SEC)
+    if candidate <= now:
+        candidate = base + timedelta(minutes=interval, seconds=CHECK_DELAY_SEC)
+    return max((candidate - now).total_seconds(), 1.0)
+
+
+async def broadcast(text: str) -> None:
+    """Шлёт сообщение во все чаты, с которыми бот уже разговаривал."""
+    try:
+        targets = signal_log.chats()
+    except Exception:  # noqa: BLE001
+        log.exception("не удалось прочитать список чатов")
+        return
+    if not targets:
+        log.warning("автосообщение некому отправить — чаты не запомнены")
+        return
+    for chat_id in targets:
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception:  # noqa: BLE001
+            log.exception("не удалось отправить сообщение в чат %s", chat_id)
+
+
+async def auto_check() -> None:
+    """Одна проверка по расписанию: проанализировать и решить, слать ли."""
+    result = await analyze()
+    kind = result["kind"]
+
+    if kind in ("signal", "wait"):
+        _auto["failures"] = 0
+        _auto["alerted"] = False
+
+    if kind != "signal":
+        if kind == "wait":
+            return  # молчим: ждём, пока появятся факторы
+        _auto["failures"] += 1
+        log.warning(
+            "автопроверка не удалась (%s), подряд: %s",
+            kind, _auto["failures"],
+        )
+        if _auto["failures"] >= AUTO_FAILURE_ALERT and not _auto["alerted"]:
+            _auto["alerted"] = True
+            await broadcast(
+                "⚠️ Автопроверка не работает "
+                f"{_auto['failures']} раза подряд.\n\n{result['text']}"
+            )
+        return
+
+    direction = result["trade"]["direction"]
+    same = direction == _auto["direction"]
+    recent = time.monotonic() - _auto["sent_at"] < REPEAT_SIGNAL_SEC
+    if same and recent:
+        log.info("сигнал %s уже показан, не повторяю", direction)
+        return
+    note_sent(direction)
+    await broadcast(result["text"])
+
+
+async def scheduler() -> None:
+    """Фоновая задача: проверяет рынок по расписанию, пока жив процесс."""
+    log.info(
+        "автопроверка включена: каждые %s мин (+%s с после закрытия свечи)",
+        CHECK_INTERVAL_MIN,
+        CHECK_DELAY_SEC,
+    )
+    while True:
+        delay = seconds_until_next_check()
+        log.info("следующая автопроверка через %.1f мин", delay / 60)
+        await asyncio.sleep(delay)
+        try:
+            await auto_check()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("автопроверка упала")
+
+
 async def main():
     await start_web_server()
+    seed_auto_state()
     log.info(
         "Бот запущен: баланс %s, риск %s%%, модель %s",
         usd(BALANCE),
         risk_percent(BALANCE),
         GROQ_MODEL,
     )
+    if CHECK_INTERVAL_MIN > 0:
+        _background_tasks.add(asyncio.create_task(scheduler()))
+    else:
+        log.info("автопроверка выключена: CHECK_INTERVAL_MIN=0")
     await dp.start_polling(bot)
 
 
