@@ -50,8 +50,14 @@ REQUIRED_FACTORS = 3              # конфлюэнция: минимум по�
 # закрытия свечи соответствующего таймфрейма. 0 — автопроверка выключена.
 CHECK_INTERVAL_MIN = int(os.getenv("CHECK_INTERVAL_MIN", "15"))
 CHECK_DELAY_SEC = int(os.getenv("CHECK_DELAY_SEC", "45"))
-REPEAT_SIGNAL_SEC = 3600          # тот же сигнал вспоминаем не чаще раза в час
-AUTO_FAILURE_ALERT = 4            # предупредить после N подряд неудачных проверок
+REPEAT_SIGNAL_SEC = int(os.getenv("REPEAT_SIGNAL_SEC", "3600"))
+AUTO_FAILURE_ALERT = int(os.getenv("AUTO_FAILURE_ALERT", "4"))
+TZ_OFFSET_MIN = int(os.getenv("TZ_OFFSET_MIN", "180"))   # показывать время: Москва = +180
+# Сигнал уходит в чат, если это направление встретилось CONFIRM_REQUIRED раз
+# за CONFIRM_WINDOW_SEC секунд — подряд не обязательно: WAIT из окна не выбрасываем,
+# но и не подтверждаем им. Лог показал: три WAIT делят два LONG за 45 минут.
+CONFIRM_REQUIRED = int(os.getenv("CONFIRM_REQUIRED", "2"))
+CONFIRM_WINDOW_SEC = int(os.getenv("CONFIRM_WINDOW_SEC", "3600"))
 
 GROQ_MODEL = "openai/gpt-oss-120b"
 SYMBOL = "BTC/USDT"
@@ -406,6 +412,23 @@ def _plural(number: int, forms: tuple) -> str:
     return forms[2]
 
 
+def _stamp(iso: str) -> str:
+    """Время записи из базы в нашем поясе: сервер пишет свой, мы показываем свой."""
+    if not iso:
+        return ""
+    try:
+        moment = datetime.fromisoformat(iso)
+    except ValueError:
+        # Мусор в базе не бывает: пишет now_iso(). Старые записи без T — да.
+        return iso[5:16].replace("T", " ") if iso[:4].isdigit() else ""
+    if moment.tzinfo is None:
+        # Старые записи без пояса считаем UTC — серверы Render в нём живут.
+        return (moment + timedelta(minutes=TZ_OFFSET_MIN)).strftime("%m-%d %H:%M")
+    stored = moment.utcoffset() or timedelta(0)
+    local = moment - stored + timedelta(minutes=TZ_OFFSET_MIN)
+    return local.strftime("%m-%d %H:%M")
+
+
 def format_history(rows: list) -> str:
     """Человекочитаемый список записей из базы."""
     lines = [
@@ -414,7 +437,7 @@ def format_history(rows: list) -> str:
         "",
     ]
     for row in rows:
-        stamp = (row["created_at"] or "")[5:16].replace("T", " ")
+        stamp = _stamp(row["created_at"])
         direction = row["direction"]
 
         if direction in ("LONG", "SHORT") and row["profit_usd"] is not None:
@@ -497,6 +520,8 @@ async def analyze(progress=None) -> dict:
 
     Возвращает:
       kind   — signal | wait | nodata | data_error | groq_error | parse_error
+      score  — сколько сигналов этого направления встретилось за окно
+               подтверждения (0 для не-сигналов)
       text   — готовое сообщение для пользователя
       trade  — расчёт (для лога)
       context, raw — контекст рынка и сырой ответ модели (для лога)
@@ -509,6 +534,7 @@ async def analyze(progress=None) -> dict:
         log_signal(trade, {})
         return {
             "kind": "data_error",
+            "score": register_verdict("data_error"),
             "text": f"❌ Не удалось собрать рыночные данные:\n{exc}",
             "trade": trade,
             "context": {},
@@ -527,6 +553,7 @@ async def analyze(progress=None) -> dict:
         log_signal(trade, context)
         return {
             "kind": "nodata",
+            "score": register_verdict("nodata"),
             "text": data_report(context),
             "trade": trade,
             "context": context,
@@ -553,6 +580,7 @@ async def analyze(progress=None) -> dict:
         log_signal(trade, context)
         return {
             "kind": "groq_error",
+            "score": register_verdict("groq_error"),
             "text": f"❌ Ошибка вызова нейросети:\n{exc}",
             "trade": trade,
             "context": context,
@@ -569,6 +597,7 @@ async def analyze(progress=None) -> dict:
         log_signal(trade, context, raw)
         return {
             "kind": "parse_error",
+            "score": register_verdict("parse_error"),
             "text": f"❌ Модель ответила не по формату: {exc}",
             "trade": trade,
             "context": context,
@@ -579,6 +608,7 @@ async def analyze(progress=None) -> dict:
     kind = "signal" if trade["direction"] in ("LONG", "SHORT") else "wait"
     return {
         "kind": kind,
+        "score": register_verdict(kind, trade["direction"]),
         "text": format_trade(trade),
         "trade": trade,
         "context": context,
@@ -659,8 +689,26 @@ _auto = {
     "sent_at": 0.0,      # monotonic-время отправки (анти-спам)
     "failures": 0,       # подряд неудачных проверок
     "alerted": False,     # предупреждение об отказе уже уходило
+    "seen": [],          # [(направление, момент)] — окно подтверждения
 }
 _background_tasks: set = set()
+
+
+def register_verdict(kind: str, direction=None) -> int:
+    """Ведёт окно последних сигналов и считает, сколько их одного направления.
+
+    За две минуты модель успевает пройти SHORT → WAIT → LONG, поэтому одного
+    появления мало. Считаем повтор в пределах CONFIRM_WINDOW_SEC — даже если
+    между ними были WAIT: они не подтверждают, но и не обнуляют, иначе при
+    75 % случаев «нет данных о направлении» подтверждение не наберётся никогда.
+    """
+    now = time.monotonic()
+    window = _auto["seen"]
+    window[:] = [item for item in window if now - item[1] <= CONFIRM_WINDOW_SEC]
+    if kind != "signal":
+        return 0
+    window.append((direction, now))
+    return sum(1 for item in window if item[0] == direction)
 
 
 def note_sent(direction: str) -> None:
@@ -738,12 +786,26 @@ async def auto_check() -> None:
         return
 
     direction = result["trade"]["direction"]
+    score = result.get("score", 0)  # посчитан в analyze() через register_verdict
+    if score < CONFIRM_REQUIRED:
+        # Один раз за окно показалось — ждём повтора. Именно так из лога
+        # уходит переворот SHORT → WAIT → LONG, который появился трижды за 2 минуты.
+        log.info(
+            "сигнал %s не подтверждён (%s из %s за %s мин) — молчим",
+            direction, score, CONFIRM_REQUIRED, CONFIRM_WINDOW_SEC // 60,
+        )
+        return
+
     same = direction == _auto["direction"]
     recent = time.monotonic() - _auto["sent_at"] < REPEAT_SIGNAL_SEC
     if same and recent:
         log.info("сигнал %s уже показан, не повторяю", direction)
         return
     note_sent(direction)
+    log.info(
+        "сигнал %s подтверждён (%s за %s мин) — отправляю",
+        direction, score, CONFIRM_WINDOW_SEC // 60,
+    )
     await broadcast(result["text"])
 
 
