@@ -103,6 +103,18 @@ def risk_percent(balance: float) -> float:
     return RISK_TIERS[-1][1]
 
 
+def min_stop_pct(balance: float) -> float:
+    """Минимальная ширина стопа, при которой весь бюджет риска влезает
+    в потолок плеча.
+
+    Позиция ограничена балансом × MAX_LEVERAGE, а риск = позиция × стоп.
+    Значит полный бюджет достигается только при стопе не уже
+    риск% / MAX_LEVERAGE. Теснее — позиция упирается в потолок и риск
+    (а вместе с ним и профит) оказываются ниже цели.
+    """
+    return risk_percent(balance) / MAX_LEVERAGE
+
+
 def choose_leverage(position_usd: float, balance: float) -> float:
     """Минимальное плечо, при котором маржа укладывается в баланс."""
     for level in LEVERAGE_LADDER:
@@ -202,7 +214,9 @@ def build_trade(setup: dict, available: list, balance: float) -> dict:
     target_position = target_risk / stop_fraction
 
     # Позиция ограничена потолком плеча — тогда фактический риск оказывается ниже цели.
-    capped = target_position > balance * MAX_LEVERAGE
+    # Допуск 0.1% нужен из-за плавающей точки: при стопе ровно на границе
+    # позиция формально упирается в потолок, но риск остаётся полным.
+    capped = target_position > balance * MAX_LEVERAGE * 1.001
     position = min(target_position, balance * MAX_LEVERAGE)
 
     leverage = choose_leverage(position, balance)
@@ -266,6 +280,12 @@ def format_trade(trade: dict) -> str:
             "⚠️ Позиция упёрлась в потолок плеча "
             f"{MAX_LEVERAGE:g}x — риск меньше целевого."
         )
+        lines.append(
+            f"   Риск вышел {trade['risk_pct']:.2f}% вместо "
+            f"{trade['target_pct']:g}%, профит сократился. Для полного "
+            f"бюджета нужен стоп не уже "
+            f"{min_stop_pct(trade['balance']):.2f}% от цены входа."
+        )
     if trade["rr"] >= PREFERRED_RR:
         lines.append(
             f"📈 Цель 1:{trade['rr']:.1f} — не ниже приоритетной "
@@ -294,6 +314,9 @@ def build_system_prompt(available: list, balance: float) -> str:
         "поддерживает сетап.\n"
         f"- Если подтверждено меньше {REQUIRED_FACTORS} факторов — direction: WAIT.\n"
         "- Уровни задавай от структуры рынка (уровни, EMA, ATR, стенки), не выдумывай.\n"
+        f"- Стоп не ближе {min_stop_pct(balance):.2f}% от цены входа: при более "
+        f"тесном стопе позиция упрётся в потолок плеча {MAX_LEVERAGE:g}x, "
+        "риск будет меньше бюджета, а профит ниже возможного.\n"
         "- Не придумывай уровни, которых нет в данных.\n"
         "- Пиши поле reason строго на русском языке.\n\n"
         "Ответь СТРОГО одним JSON-объектом, без markdown и пояснений вокруг:\n"
