@@ -34,10 +34,10 @@ async def start_cmd(message: Message):
 
 @dp.message(Command("predict"))
 async def predict_cmd(message: Message):
-    msg = await message.answer("📊 Получаю данные с биржи Bybit...")
+    msg = await message.answer("📊 Получаю данные с биржи MEXC...")
     try:
-        # Используем Bybit вместо Binance, чтобы обойти гео-ограничения
-        exchange = ccxt.bybit()
+        # MEXC отлично работает на датацентровых IP Render без CloudFront-блоков
+        exchange = ccxt.mexc()
         ticker = await exchange.fetch_ticker('BTC/USDT')
         await exchange.close()
 
