@@ -36,7 +36,8 @@ BALANCE = float(os.getenv("BALANCE", "100"))
 
 # Риск на сделку зависит от баланса: до $200 — 5%, до $300 — 3%, дальше — 1%.
 RISK_TIERS = ((200.0, 5.0), (300.0, 3.0), (float("inf"), 1.0))
-MIN_RR = 3.0                      # минимальное Risk/Reward
+MIN_RR = 3.0                      # жёсткий полигон: ниже — сетап отсекается
+PREFERRED_RR = 5.0                # целевая цель: к ней модель должна стремиться
 MAX_LEVERAGE = 10.0               # потолок плеча (правило: никогда 20x+)
 LEVERAGE_LADDER = (1.0, 2.0, 3.0, 5.0, 10.0)
 MIN_ATR_PCT = 0.05                # ниже — волатильности нет, сидим на руках
@@ -254,7 +255,8 @@ def format_trade(trade: dict) -> str:
         f"базовый риск {trade['target_pct']:g}%):",
         f"🔴 Возможный убыток (Риск): -{usd(trade['risk'])} "
         f"({trade['risk_pct']:.2f}% баланса)",
-        f"🟢 Заработок (Профит): +{usd(trade['profit'])}",
+        f"🟢 Заработок (Профит): +{usd(trade['profit'])} "
+        f"({trade['profit'] / trade['balance'] * 100:.1f}% баланса)",
         f"⚖️ Risk/Reward: 1 : {trade['rr']:.2f}",
         f"📦 Размер позиции: {trade['size']:.6f} {asset} ({usd(trade['position'])})",
         f"🔑 Плечо: {trade['leverage']:g}x (маржа {usd(trade['margin'])})",
@@ -263,6 +265,11 @@ def format_trade(trade: dict) -> str:
         lines.append(
             "⚠️ Позиция упёрлась в потолок плеча "
             f"{MAX_LEVERAGE:g}x — риск меньше целевого."
+        )
+    if trade["rr"] >= PREFERRED_RR:
+        lines.append(
+            f"📈 Цель 1:{trade['rr']:.1f} — не ниже приоритетной "
+            f"1:{PREFERRED_RR:g}, прибыль на максимуме."
         )
     lines += [
         f"✅ Факторы: {factors}",
@@ -277,7 +284,9 @@ def build_system_prompt(available: list, balance: float) -> str:
         "Ты — строгий финансовый аналитик и алгоритмический трейдер.\n"
         f"- Баланс: {usd(balance)}.\n"
         f"- Риск на сделку: {percent:g}% ({usd(balance * percent / 100)}).\n"
-        f"- Минимальное Risk/Reward: 1:{MIN_RR:g}.\n"
+        f"- Risk/Reward: жёсткий минимум 1:{MIN_RR:g}, но приоритет — максимум "
+        f"прибыли. Целись в 1:{PREFERRED_RR:g} и дальше (1:8–1:10), пока уровень "
+        "реально существует на графике. Не срезай TP ради вероятности попадания.\n"
         "- Размер позиции, плечо и риск считает система — ты их не указываешь.\n\n"
         "Доступные источники: " + ", ".join(available) + ".\n\n"
         "Правила:\n"
@@ -293,6 +302,24 @@ def build_system_prompt(available: list, balance: float) -> str:
         '"technicals","news"], "reason": "<2-3 предложения>"}\n'
         "Если сетапа нет — direction: WAIT, entry/sl/tp = 0, "
         "confirmed_factors = []."
+    )
+
+
+def data_report(context: dict) -> str:
+    """Честный ответ, почему сигнала нет, вместо запроса к модели."""
+    working = [FACTOR_NAMES[name] for name in context["available"]]
+    broken = [FACTOR_NAMES[name] for name in context["errors"]]
+    detail = "\n".join(
+        f"{FACTOR_NAMES[name]}: {reason[:140]}"
+        for name, reason in context["errors"].items()
+    )
+    return (
+        "❌ Недостаточно данных для сигнала.\n\n"
+        f"Работают: {', '.join(working) or 'ничего'}\n"
+        f"Не отвечают: {', '.join(broken) or 'ничего'}\n\n"
+        f"Для сигнала нужно минимум {REQUIRED_FACTORS} источника "
+        f"из {len(FACTOR_NAMES)}.\n"
+        + (f"\nПричины:\n{detail}" if detail else "")
     )
 
 
@@ -315,7 +342,8 @@ async def start_cmd(message: Message):
         "и дам торговый сетап.\n\n"
         f"Баланс: {usd(BALANCE)}\n"
         f"Риск на сделку сейчас: {percent:g}% ({usd(BALANCE * percent / 100)})\n"
-        f"Фильтры: R:R от 1:{MIN_RR:g}, минимум {REQUIRED_FACTORS} фактора, "
+        f"Фильтры: R:R от 1:{MIN_RR:g}, цель 1:{PREFERRED_RR:g} и дальше, "
+        f"минимум {REQUIRED_FACTORS} фактора, "
         f"плечо до {MAX_LEVERAGE:g}x"
     )
 
@@ -331,8 +359,15 @@ async def predict_cmd(message: Message):
         await safe_edit(msg, f"❌ Не удалось собрать рыночные данные:\n{exc}")
         return
 
-    if not context["available"]:
-        await safe_edit(msg, "❌ Ни один источник данных не ответил. Повтори позже.")
+    log.info(
+        "факторы: %s | ошибки: %s",
+        ", ".join(context["available"]) or "нет",
+        context["errors"] or "нет",
+    )
+
+    if len(context["available"]) < REQUIRED_FACTORS:
+        # Без 3 источников сигнал невозможен — не тратим запрос к модели впустую.
+        await safe_edit(msg, data_report(context))
         return
 
     await safe_edit(msg, f"🧠 Анализирую через {GROQ_MODEL}...")
