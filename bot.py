@@ -5,12 +5,14 @@ import logging
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import Message
-import ccxt.async_support as ccxt
 from groq import AsyncGroq
 
-# --- Настройки ---------------------------------------------------------
+from market import build_market_context
+
+# --- Настройки окружения ----------------------------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
@@ -25,16 +27,39 @@ missing = [
 if missing:
     raise SystemExit(
         "Не заданы переменные окружения: " + ", ".join(missing)
-        + ". Задай их в настройках хостинга (Koyeb)."
+        + ". Задай их в настройках Render (Environment → Environment Variables)."
     )
 
-# Торговые параметры
-DEPOSIT = 100.0                                  # депозит пользователя, $
-RISK_PCT = 3.0                                   # риск на сделку, % от депозита
-RISK_AMOUNT = DEPOSIT * RISK_PCT / 100           # = $3 на сделку
-MIN_RR = 3.0                                     # минимальное Risk/Reward
-GROQ_MODEL = "llama-3.1-8b-instant"
+# --- Параметры риска ----------------------------------------------------
+# Баланс можно править переменной BALANCE на Render (по умолчанию $100).
+BALANCE = float(os.getenv("BALANCE", "100"))
+
+# Риск на сделку зависит от баланса: до $200 — 5%, до $300 — 3%, дальше — 1%.
+RISK_TIERS = ((200.0, 5.0), (300.0, 3.0), (float("inf"), 1.0))
+MIN_RR = 3.0                      # минимальное Risk/Reward
+MAX_LEVERAGE = 10.0               # потолок плеча (правило: никогда 20x+)
+LEVERAGE_LADDER = (1.0, 2.0, 3.0, 5.0, 10.0)
+MIN_ATR_PCT = 0.05                # ниже — волатильности нет, сидим на руках
+REQUIRED_FACTORS = 3              # конфлюэнция: минимум подтверждённых факторов
+
+GROQ_MODEL = "openai/gpt-oss-120b"
 SYMBOL = "BTC/USDT"
+
+FACTOR_NAMES = {
+    "orderbook": "стакан",
+    "derivatives": "деривативы (OI/funding)",
+    "technicals": "индикаторы",
+    "news": "новости",
+}
+FACTOR_ALIASES = {
+    "orderbook": "orderbook", "order_book": "orderbook", "order book": "orderbook",
+    "depth": "orderbook", "стакан": "orderbook", "liquidity": "orderbook",
+    "derivatives": "derivatives", "futures": "derivatives", "funding": "derivatives",
+    "oi": "derivatives", "open interest": "derivatives", "деривативы": "derivatives",
+    "technicals": "technicals", "technical": "technicals", "ta": "technicals",
+    "indicators": "technicals", "индикаторы": "technicals", "технический": "technicals",
+    "news": "news", "sentiment": "news", "новости": "news", "сентимент": "news",
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,52 +72,49 @@ dp = Dispatcher()
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 
-# Фиктивный веб-сервер, чтобы хостинг не закрывал сервис по таймауту портов
+# Фиктивный веб-сервер, чтобы хостинг не закрывал сервис по таймауту портов.
+# Ссылки держим на уровне модуля: локальные переменные GC мог бы выбросить,
+# и сервер перестал бы отвечать, пока бот работает.
+_runner = None
+_site = None
+
+
 async def handle_health_check(request):
     return web.Response(text="Bot is running!")
 
 
 async def start_web_server():
+    global _runner, _site
     app = web.Application()
     app.router.add_get("/", handle_health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
+    _runner = web.AppRunner(app)
+    await _runner.setup()
     port = int(os.getenv("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+    _site = web.TCPSite(_runner, "0.0.0.0", port)
+    await _site.start()
 
 
-# --- Рыночные данные ---------------------------------------------------
-async def get_market_data(symbol: str = SYMBOL) -> str:
-    exchange = ccxt.mexc()
-    try:
-        ticker = await exchange.fetch_ticker(symbol)
-    finally:
-        await exchange.close()  # закроется всегда, даже при исключении
-
-    return (
-        f"Пара: {symbol}\n"
-        f"Последняя цена: ${ticker.get('last')}\n"
-        f"Изменение за 24ч: ${ticker.get('percentage')}%\n"
-        f"Максимум за 24ч: ${ticker.get('high')}\n"
-        f"Минимум за 24ч: ${ticker.get('low')}"
-    )
+# --- Риск-менеджмент (считает только Python, нейросеть не участвует) ----
+def risk_percent(balance: float) -> float:
+    for limit, percent in RISK_TIERS:
+        if balance < limit:
+            return percent
+    return RISK_TIERS[-1][1]
 
 
-SYSTEM_PROMPT = (
-    "Ты — строгий финансовый аналитик и алгоритмический трейдер.\n"
-    f"- Депозит пользователя: ${DEPOSIT:.0f}.\n"
-    f"- Риск на сделку: строго {RISK_PCT:g}% (${RISK_AMOUNT:.0f}).\n"
-    f"- Соотношение Risk/Reward: минимум 1:{MIN_RR:g}.\n"
-    "- Размер позиции посчитает система, ты его не указываешь.\n\n"
-    "Ответь СТРОГО одним JSON-объектом, без markdown и пояснений вокруг:\n"
-    '{"direction": "LONG|SHORT|WAIT", "entry": <число>, "sl": <число>, '
-    '"tp": <число>, "reason": "<2-3 предложения про тренд или уровни>"}\n'
-    "Если подходящего сетапа нет — direction: WAIT, а entry/sl/tp поставь 0."
-)
+def choose_leverage(position_usd: float, balance: float) -> float:
+    """Минимальное плечо, при котором маржа укладывается в баланс."""
+    for level in LEVERAGE_LADDER:
+        if position_usd / level <= balance:
+            return level
+    return MAX_LEVERAGE
 
 
-# --- Разбор и расчёт ---------------------------------------------------
+def usd(value: float) -> str:
+    return f"${value:,.2f}"
+
+
+# --- Разбор ответа модели ----------------------------------------------
 def parse_setup(raw: str) -> dict:
     """Достаёт JSON из ответа модели (переживает markdown-обёртку)."""
     start, end = raw.find("{"), raw.rfind("}")
@@ -110,29 +132,60 @@ def parse_setup(raw: str) -> dict:
         except (TypeError, ValueError):
             raise ValueError(f"поле {key} не число: {data.get(key)!r}")
 
+    raw_factors = data.get("confirmed_factors") or []
+    if isinstance(raw_factors, str):
+        raw_factors = [raw_factors]
+    factors = set()
+    for item in raw_factors:
+        key = FACTOR_ALIASES.get(str(item).strip().lower())
+        if key:
+            factors.add(key)
+
     return {
         "direction": direction,
         "entry": number("entry"),
         "sl": number("sl"),
         "tp": number("tp"),
         "reason": str(data.get("reason", "")).strip(),
+        "factors": factors,
     }
 
 
-def build_trade(setup: dict) -> dict:
-    """Считает размер позиции и R:R кодом — нейросеть ими не управляет."""
+def build_trade(setup: dict, available: list, balance: float) -> dict:
+    """Считает риск, позицию, плечо и профит кодом — модель ими не управляет."""
     reason = setup["reason"]
 
     if setup["direction"] == "WAIT":
         return {"direction": "WAIT", "reason": reason or "Подходящего сетапа нет."}
 
+    # Конфлюэнция: минимум REQUIRED_FACTORS, но не больше, чем есть источников.
+    required = min(REQUIRED_FACTORS, len(available))
+    confirmed = setup["factors"] & set(available)
+    if required and len(confirmed) < required:
+        return {
+            "direction": "WAIT",
+            "reason": (
+                f"Подтверждено факторов: {len(confirmed)} из требуемых {required}. "
+                f"По правилу конфлюэнции сетап отброшен.\n{reason}"
+            ),
+        }
+
     entry, sl, tp = setup["entry"], setup["sl"], setup["tp"]
     spread = abs(entry - sl)
-
     if entry <= 0 or spread <= 0:
         return {
             "direction": "WAIT",
             "reason": f"Модель вернула некорректные уровни (entry={entry}, sl={sl}).",
+        }
+
+    atr_pct = setup.get("atr_pct")
+    if atr_pct is not None and atr_pct < MIN_ATR_PCT:
+        return {
+            "direction": "WAIT",
+            "reason": (
+                f"ATR {atr_pct:.3f}% ниже порога {MIN_ATR_PCT}% — "
+                "волатильности нет, рынок стоит."
+            ),
         }
 
     rr = abs(tp - entry) / spread
@@ -142,96 +195,184 @@ def build_trade(setup: dict) -> dict:
             "reason": f"R/R {rr:.2f} ниже требуемых 1:{MIN_RR:g} — сетап отброшен.\n{reason}",
         }
 
+    stop_fraction = spread / entry
+    percent = risk_percent(balance)
+    target_risk = balance * percent / 100
+    target_position = target_risk / stop_fraction
+
+    # Позиция ограничена потолком плеча — тогда фактический риск оказывается ниже цели.
+    capped = target_position > balance * MAX_LEVERAGE
+    position = min(target_position, balance * MAX_LEVERAGE)
+
+    leverage = choose_leverage(position, balance)
+    actual_risk = position * stop_fraction
+    profit = position * abs(tp - entry) / entry
+    size = position / entry
+
     return {
         "direction": setup["direction"],
         "entry": entry,
         "sl": sl,
         "tp": tp,
-        "size": RISK_AMOUNT / spread,   # так, чтобы стоп съел ровно $3
         "rr": rr,
-        "sl_pct": spread / entry * 100,
+        "size": size,
+        "position": position,
+        "leverage": leverage,
+        "margin": position / leverage,
+        "risk": actual_risk,
+        "risk_pct": actual_risk / balance * 100,
+        "target_pct": percent,
+        "profit": profit,
+        "sl_pct": stop_fraction * 100,
+        "capped": capped,
+        "balance": balance,
+        "confirmed": sorted(confirmed, key=lambda k: list(FACTOR_NAMES).index(k)),
         "reason": reason,
     }
 
 
-def usd(value: float) -> str:
-    return f"${value:,.2f}"
-
-
 def format_trade(trade: dict) -> str:
-    header = f"📈 Анализ {GROQ_MODEL}\n"
+    asset = SYMBOL.split("/")[0]
 
     if trade["direction"] == "WAIT":
-        return f"{header}\n⏸ WAIT\n\n{trade['reason']}"
+        return "\n".join(
+            [
+                "⏸ WAIT — сигнала нет",
+                "",
+                trade["reason"],
+            ]
+        )
 
-    asset = SYMBOL.split("/")[0]
-    return "\n".join(
-        [
-            header,
-            f"Направление: {trade['direction']}",
-            f"Вход: {usd(trade['entry'])}",
-            f"Стоп: {usd(trade['sl'])} ({trade['sl_pct']:.1f}% от входа)",
-            f"Тейк: {usd(trade['tp'])}",
-            "",
-            f"Размер позиции: {trade['size']:.6f} {asset} ({usd(trade['size'] * trade['entry'])})",
-            f"Риск на сделку: {usd(RISK_AMOUNT)} ({RISK_PCT:g}% от {usd(DEPOSIT)})",
-            f"R:R: 1:{trade['rr']:.2f}",
-            "",
-            f"Обоснование: {trade['reason']}",
-        ]
+    factors = ", ".join(FACTOR_NAMES.get(key, key) for key in trade["confirmed"])
+    lines = [
+        f"🚨 AI SIGNAL: {SYMBOL} ({trade['direction']})",
+        f"🔹 Вход: {usd(trade['entry'])}",
+        f"🛑 Стоп-лосс: {usd(trade['sl'])} ({trade['sl_pct']:.2f}% от входа)",
+        f"🎯 Тейк-профит: {usd(trade['tp'])}",
+        "",
+        f"📊 Математика сделки (баланс {usd(trade['balance'])}, "
+        f"базовый риск {trade['target_pct']:g}%):",
+        f"🔴 Возможный убыток (Риск): -{usd(trade['risk'])} "
+        f"({trade['risk_pct']:.2f}% баланса)",
+        f"🟢 Заработок (Профит): +{usd(trade['profit'])}",
+        f"⚖️ Risk/Reward: 1 : {trade['rr']:.2f}",
+        f"📦 Размер позиции: {trade['size']:.6f} {asset} ({usd(trade['position'])})",
+        f"🔑 Плечо: {trade['leverage']:g}x (маржа {usd(trade['margin'])})",
+    ]
+    if trade["capped"]:
+        lines.append(
+            "⚠️ Позиция упёрлась в потолок плеча "
+            f"{MAX_LEVERAGE:g}x — риск меньше целевого."
+        )
+    lines += [
+        f"✅ Факторы: {factors}",
+        f"💡 Причина: {trade['reason']}",
+    ]
+    return "\n".join(lines)
+
+
+def build_system_prompt(available: list, balance: float) -> str:
+    percent = risk_percent(balance)
+    return (
+        "Ты — строгий финансовый аналитик и алгоритмический трейдер.\n"
+        f"- Баланс: {usd(balance)}.\n"
+        f"- Риск на сделку: {percent:g}% ({usd(balance * percent / 100)}).\n"
+        f"- Минимальное Risk/Reward: 1:{MIN_RR:g}.\n"
+        "- Размер позиции, плечо и риск считает система — ты их не указываешь.\n\n"
+        "Доступные источники: " + ", ".join(available) + ".\n\n"
+        "Правила:\n"
+        "- Подтверждай фактор ТОЛЬКО если его блок есть в данных и реально "
+        "поддерживает сетап.\n"
+        f"- Если подтверждено меньше {REQUIRED_FACTORS} факторов — direction: WAIT.\n"
+        "- Уровни задавай от структуры рынка (уровни, EMA, ATR, стенки), не выдумывай.\n"
+        "- Не придумывай уровни, которых нет в данных.\n"
+        "- Пиши поле reason строго на русском языке.\n\n"
+        "Ответь СТРОГО одним JSON-объектом, без markdown и пояснений вокруг:\n"
+        '{"direction": "LONG|SHORT|WAIT", "entry": <число>, "sl": <число>, '
+        '"tp": <число>, "confirmed_factors": ["orderbook","derivatives",'
+        '"technicals","news"], "reason": "<2-3 предложения>"}\n'
+        "Если сетапа нет — direction: WAIT, entry/sl/tp = 0, "
+        "confirmed_factors = []."
     )
 
 
 # --- Команды -----------------------------------------------------------
+async def safe_edit(message: Message, text: str) -> None:
+    """edit_text, который не падает, если текст не изменился."""
+    try:
+        await message.edit_text(text)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+
+
 @dp.message(Command("start"))
 async def start_cmd(message: Message):
+    percent = risk_percent(BALANCE)
     await message.answer(
         "👋 Привет! Я крипто-аналитик.\n"
-        "Отправь /predict — дам торговый сетап по BTC/USDT."
+        "Отправь /predict — соберу стакан, деривативы, индикаторы и новости, "
+        "и дам торговый сетап.\n\n"
+        f"Баланс: {usd(BALANCE)}\n"
+        f"Риск на сделку сейчас: {percent:g}% ({usd(BALANCE * percent / 100)})\n"
+        f"Фильтры: R:R от 1:{MIN_RR:g}, минимум {REQUIRED_FACTORS} фактора, "
+        f"плечо до {MAX_LEVERAGE:g}x"
     )
 
 
 @dp.message(Command("predict"))
 async def predict_cmd(message: Message):
-    msg = await message.answer("📊 Получаю данные с биржи MEXC...")
+    msg = await message.answer("📊 Собираю данные: стакан, деривативы, индикаторы, новости...")
 
     try:
-        market_data = await get_market_data()
-    except Exception as e:
-        log.exception("не удалось получить данные с биржи")
-        await msg.edit_text(f"❌ Не удалось получить данные с MEXC:\n{e}")
+        context = await build_market_context(SYMBOL)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("не удалось собрать рыночные данные")
+        await safe_edit(msg, f"❌ Не удалось собрать рыночные данные:\n{exc}")
         return
 
-    await msg.edit_text("🧠 Анализирую данные...")
+    if not context["available"]:
+        await safe_edit(msg, "❌ Ни один источник данных не ответил. Повтори позже.")
+        return
+
+    await safe_edit(msg, f"🧠 Анализирую через {GROQ_MODEL}...")
 
     try:
         response = await groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": market_data},
+                {"role": "system", "content": build_system_prompt(context["available"], BALANCE)},
+                {"role": "user", "content": context["text"]},
             ],
-            temperature=0.2,
+            temperature=0.05,
+            response_format={"type": "json_object"},
         )
         raw = response.choices[0].message.content or ""
-    except Exception as e:
+    except Exception as exc:  # noqa: BLE001
         log.exception("не удалось вызвать нейросеть")
-        await msg.edit_text(f"❌ Ошибка вызова нейросети:\n{e}")
+        await safe_edit(msg, f"❌ Ошибка вызова нейросети:\n{exc}")
         return
 
     try:
-        trade = build_trade(parse_setup(raw))
-    except (ValueError, json.JSONDecodeError) as e:
-        log.warning("не удалось разобрать ответ модели: %s | raw=%s", e, raw)
-        await msg.edit_text(f"❌ Модель ответила не по формату: {e}")
+        setup = parse_setup(raw)
+        setup["atr_pct"] = context["atr_pct"]
+        trade = build_trade(setup, context["available"], BALANCE)
+    except (ValueError, json.JSONDecodeError) as exc:
+        log.warning("не удалось разобрать ответ модели: %s | raw=%s", exc, raw)
+        await safe_edit(msg, f"❌ Модель ответила не по формату: {exc}")
         return
 
-    await msg.edit_text(format_trade(trade))
+    await safe_edit(msg, format_trade(trade))
 
 
 async def main():
     await start_web_server()
-    log.info("Бот запущен")
+    log.info(
+        "Бот запущен: баланс %s, риск %s%%, модель %s",
+        usd(BALANCE),
+        risk_percent(BALANCE),
+        GROQ_MODEL,
+    )
     await dp.start_polling(bot)
 
 
