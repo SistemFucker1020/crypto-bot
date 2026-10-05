@@ -1,88 +1,69 @@
 import os
 import asyncio
-import ccxt.async_support as ccxt
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from groq import Groq
+from aiogram.types import Message
+from aiohttp import web
+import ccxt.async_support as ccxt
+from groq import AsyncGroq
 
-# Ключи автоматически подтянет Koyeb из настроек
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+# Инициализация API
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
-groq_client = Groq(api_key=GROQ_API_KEY)
+groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
+# Фиктивный веб-сервер, чтобы Render не закрывал сервис по таймауту портов
+async def handle_health_check(request):
+    return web.Response(text="Bot is running!")
 
-async def get_bybit_market_data(symbol: str = "BTC/USDT"):
-    exchange = ccxt.bybit()
-    try:
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe="15m", limit=5)
-        ticker = await exchange.fetch_ticker(symbol)
-        await exchange.close()
-
-        last_price = ticker["last"]
-        candles_summary = "\n".join(
-            [f"Свеча: Open={c[1]}, High={c[2]}, Low={c[3]}, Close={c[4]}" for c in ohlcv]
-        )
-        return f"Пара: {symbol}\nТекущая цена: ${last_price}\nПоследние 5 свечей (15m):\n{candles_summary}"
-    except Exception as e:
-        await exchange.close()
-        return f"Ошибка получения данных с Bybit: {e}"
-
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.answer(
-        "👋 **Трейдинг-бот запущен в облаке 24/7!**\n\n"
-        "Нейросеть Qwen 2.5 готова к анализу.\n"
-        "Отправь команду /predict, чтобы получить торговый сетап по BTC/USDT."
-    )
-
+async def start_cmd(message: Message):
+    await message.answer("👋 Привет! Я крипто-аналитик. Отправь /predict для анализа рынка.")
 
 @dp.message(Command("predict"))
-async def cmd_predict(message: types.Message):
-    status_msg = await message.answer("📊 Запрашиваем данные с биржи Bybit...")
-
-    market_data = await get_bybit_market_data("BTC/USDT")
-
-    await status_msg.edit_text("🧠 Нейросеть Qwen 2.5 просчитывает риски...")
-
-    system_prompt = (
-        "Ты — строгий финансовый аналитик и алгоритмический трейдер.\n"
-        "Твои правила:\n"
-        "- Депозит пользователя: $100.\n"
-        "- Риск на сделку: строго 3% ($3).\n"
-        "- Соотношение Risk/Reward: минимум 1:3.\n\n"
-        "Проанализируй предоставленные свечи и ответь СТРОГО по шаблону:\n"
-        "1. Направление: [LONG / SHORT / WAIT]\n"
-        "2. Точка входа (Entry): [Цена]\n"
-        "3. Stop-Loss: [Цена под расчет 3% риска]\n"
-        "4. Take-Profit: [Цена под R/R 1:3]\n"
-        "5. Обоснование: [2-3 предложения по FVG, уровням или тренду]"
-    )
-
+async def predict_cmd(message: Message):
+    msg = await message.answer("📊 Получаю данные с биржи Binance...")
     try:
-        response = groq_client.chat.completions.create(
+        exchange = ccxt.binance()
+        ticker = await exchange.fetch_ticker('BTC/USDT')
+        ohlcv = await exchange.fetch_ohlcv('BTC/USDT', timeframe='1h', limit=12)
+        await exchange.close()
+
+        prompt = f"""
+        Проанализируй текущую ситуацию по BTC/USDT:
+        Текущая цена: ${ticker['last']}
+        Изменение за 24ч: {ticker['percentage']}%
+        Максимум за 24ч: ${ticker['high']}
+        Минимум за 24ч: ${ticker['low']}
+        
+        Дай краткий прогноз и торговую рекомендацию (Long/Short/Wait).
+        """
+
+        await msg.edit_text("🧠 Анализирую данные с помощью Qwen 2.5...")
+        response = await groq_client.chat.completions.create(
             model="qwen-2.5-32b",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": market_data},
-            ],
-            temperature=0.2,
+            messages=[{"role": "user", "content": prompt}]
         )
-
-        ai_analysis = response.choices[0].message.content
-        await status_msg.edit_text(f"📈 **Анализ Qwen 2.5:**\n\n{ai_analysis}")
-
+        await msg.edit_text(response.choices[0].message.content)
     except Exception as e:
-        await status_msg.edit_text(f"❌ Ошибка вызова нейросети: {e}")
-
+        await msg.edit_text(f"❌ Ошибка: {str(e)}")
 
 async def main():
-    print("🚀 Бот запущен в облаке 24/7!")
+    await start_web_server()
+    print("🚀 Бот и веб-сервер успешно запущены!")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
