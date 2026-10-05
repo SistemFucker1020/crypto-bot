@@ -11,6 +11,7 @@ from aiogram.types import Message
 from groq import AsyncGroq
 
 from market import build_market_context
+import signal_log
 
 # --- Настройки окружения ----------------------------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -348,6 +349,101 @@ def data_report(context: dict) -> str:
     )
 
 
+# --- Лог сигналов --------------------------------------------------------
+
+def log_signal(trade: dict, context: dict, raw: str = "") -> None:
+    """Пишет исход /predict в SQLite. Ошибка логирования не должна ронять бота."""
+    try:
+        signal_log.record(
+            created_at=signal_log.now_iso(),
+            symbol=SYMBOL,
+            direction=trade.get("direction", "?"),
+            entry=trade.get("entry"),
+            sl=trade.get("sl"),
+            tp=trade.get("tp"),
+            rr=trade.get("rr"),
+            stop_pct=trade.get("sl_pct"),
+            risk_usd=trade.get("risk"),
+            risk_pct=trade.get("risk_pct"),
+            profit_usd=trade.get("profit"),
+            position_usd=trade.get("position"),
+            leverage=trade.get("leverage"),
+            margin_usd=trade.get("margin"),
+            capped=trade.get("capped"),
+            factors=",".join(trade.get("confirmed") or []),
+            sources=",".join(context.get("available") or []),
+            balance=trade.get("balance", BALANCE),
+            reason=trade.get("reason", ""),
+            raw=raw[:4000],
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("не удалось записать сигнал в лог")
+
+
+def no_data_trade(context: dict) -> dict:
+    """Мини-запись для случая, когда источников данных меньше трёх."""
+    return {
+        "direction": "NODATA",
+        "reason": "Нет источников: " + (", ".join(context["errors"]) or "неизвестно"),
+    }
+
+
+def _plural(number: int, forms: tuple) -> str:
+    """Склонение существительного: (запись, записи, записей)."""
+    if number % 10 == 1 and number % 100 != 11:
+        return forms[0]
+    if 2 <= number % 10 <= 4 and not 12 <= number % 100 <= 14:
+        return forms[1]
+    return forms[2]
+
+
+def format_history(rows: list) -> str:
+    """Человекочитаемый список записей из базы."""
+    lines = [
+        f"📜 Последние {len(rows)} {_plural(len(rows), ('запись', 'записи', 'записей'))} "
+        "(новые сверху):",
+        "",
+    ]
+    for row in rows:
+        stamp = (row["created_at"] or "")[5:16].replace("T", " ")
+        direction = row["direction"]
+
+        if direction in ("LONG", "SHORT") and row["profit_usd"] is not None:
+            balance = row["balance"] or 0
+            header = f"{stamp}  🚨 {direction}  профит ${row['profit_usd']:.2f}"
+            if balance:
+                header += f" ({row['profit_usd'] / balance * 100:.1f}%)"
+            if row["rr"]:
+                header += f"  R:R {row['rr']:.2f}"
+            lines.append(header)
+
+            details = []
+            if row["stop_pct"] is not None:
+                details.append(f"стоп {row['stop_pct']:.2f}%")
+            if row["risk_usd"] is not None:
+                details.append(f"риск ${row['risk_usd']:.2f}")
+            if row["leverage"] is not None:
+                details.append(f"плечо {row['leverage']:g}x")
+            if row["capped"]:
+                details.append("упёрлась в потолок")
+            if details:
+                lines.append("        " + ", ".join(details))
+
+        elif direction == "WAIT":
+            lines.append(f"{stamp}  ⏸ WAIT")
+            reason = (row["reason"] or "").splitlines()
+            if reason:
+                lines.append(f"        {reason[0][:90]}")
+
+        elif direction == "NODATA":
+            lines.append(f"{stamp}  ❌ нет данных  ({row['sources'] or 'ничего'})")
+
+        else:
+            lines.append(f"{stamp}  ⚠️ {direction}")
+
+    return "\n".join(lines)
+
+
 # --- Команды -----------------------------------------------------------
 async def safe_edit(message: Message, text: str) -> None:
     """edit_text, который не падает, если текст не изменился."""
@@ -364,7 +460,8 @@ async def start_cmd(message: Message):
     await message.answer(
         "👋 Привет! Я крипто-аналитик.\n"
         "Отправь /predict — соберу стакан, деривативы, индикаторы и новости, "
-        "и дам торговый сетап.\n\n"
+        "и дам торговый сетап.\n"
+        "📜 /history — прошлые сигналы и что из них вышло.\n\n"
         f"Баланс: {usd(BALANCE)}\n"
         f"Риск на сделку сейчас: {percent:g}% ({usd(BALANCE * percent / 100)})\n"
         f"Фильтры: R:R от 1:{MIN_RR:g}, цель 1:{PREFERRED_RR:g} и дальше, "
@@ -393,6 +490,7 @@ async def predict_cmd(message: Message):
     if len(context["available"]) < REQUIRED_FACTORS:
         # Без 3 источников сигнал невозможен — не тратим запрос к модели впустую.
         await safe_edit(msg, data_report(context))
+        log_signal(no_data_trade(context), context)
         return
 
     await safe_edit(msg, f"🧠 Анализирую через {GROQ_MODEL}...")
@@ -411,6 +509,7 @@ async def predict_cmd(message: Message):
     except Exception as exc:  # noqa: BLE001
         log.exception("не удалось вызвать нейросеть")
         await safe_edit(msg, f"❌ Ошибка вызова нейросети:\n{exc}")
+        log_signal({"direction": "GROQ_ERROR", "reason": str(exc)}, context)
         return
 
     try:
@@ -420,9 +519,61 @@ async def predict_cmd(message: Message):
     except (ValueError, json.JSONDecodeError) as exc:
         log.warning("не удалось разобрать ответ модели: %s | raw=%s", exc, raw)
         await safe_edit(msg, f"❌ Модель ответила не по формату: {exc}")
+        log_signal({"direction": "PARSE_ERROR", "reason": str(exc)}, context, raw)
         return
 
+    log_signal(trade, context, raw)
     await safe_edit(msg, format_trade(trade))
+
+
+@dp.message(Command("history"))
+async def history_cmd(message: Message):
+    """Последние записи из лога сигналов."""
+    try:
+        rows = signal_log.recent(8)
+        total = signal_log.total()
+    except Exception as exc:  # noqa: BLE001
+        log.exception("не удалось прочитать лог сигналов")
+        await message.answer(f"❌ Не удалось прочитать лог: {exc}")
+        return
+
+    if not rows:
+        await message.answer("📜 Лог пуст — сигналов ещё не было.")
+        return
+
+    await message.answer(f"{format_history(rows)}\n\nВсего записей: {total}")
+
+
+@dp.message(Command("stats"))
+async def stats_cmd(message: Message):
+    """Сводка для анализа paper trading."""
+    try:
+        data = signal_log.stats()
+    except Exception as exc:  # noqa: BLE001
+        log.exception("не удалось прочитать статистику")
+        await message.answer(f"❌ Не удалось прочитать статистику: {exc}")
+        return
+
+    if not data["signals"]:
+        await message.answer(
+            "📊 Сделок пока нет — статистика появится после первых сигналов."
+        )
+        return
+
+    await message.answer(
+        "\n".join(
+            [
+                "📊 Статистика сигналов",
+                "",
+                f"Сделок (LONG/SHORT): {data['signals']}",
+                f"Пропущено (WAIT): {data['waits']}",
+                f"Суммарный профит: {usd(data['total_profit'] or 0)}",
+                f"Средний профит на сделку: {usd(data['avg_profit'] or 0)}",
+                f"Средняя ширина стопа: {data['avg_stop']:.2f}%",
+                f"Средний R:R: {data['avg_rr']:.2f}",
+            ]
+        )
+    )
 
 
 async def main():
