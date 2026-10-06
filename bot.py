@@ -44,7 +44,9 @@ PREFERRED_RR = 5.0                # целевая цель: к ней моде�
 MAX_LEVERAGE = 10.0               # потолок плеча (правило: никогда 20x+)
 LEVERAGE_LADDER = (1.0, 2.0, 3.0, 5.0, 10.0)
 MIN_ATR_PCT = 0.05                # ниже — волатильности нет, сидим на руках
-REQUIRED_FACTORS = 3              # конфлюэнция: минимум подтверждённых факторов
+REQUIRED_FACTORS = int(           # конфлюэнция: голосов одного направления
+    os.getenv("REQUIRED_FACTORS", "3")
+)
 
 # Автопроверка: раз в CHECK_INTERVAL_MIN минут, через CHECK_DELAY_SEC после
 # закрытия свечи соответствующего таймфрейма. 0 — автопроверка выключена.
@@ -58,6 +60,8 @@ TZ_OFFSET_MIN = int(os.getenv("TZ_OFFSET_MIN", "180"))   # показывать 
 # но и не подтверждаем им. Лог показал: три WAIT делят два LONG за 45 минут.
 CONFIRM_REQUIRED = int(os.getenv("CONFIRM_REQUIRED", "2"))
 CONFIRM_WINDOW_SEC = int(os.getenv("CONFIRM_WINDOW_SEC", "3600"))
+# Вход модели не далее 1.5% от текущей цены — иначе уровни не от рынка.
+MAX_ENTRY_DRIFT = float(os.getenv("MAX_ENTRY_DRIFT", "0.015"))
 
 GROQ_MODEL = "openai/gpt-oss-120b"
 SYMBOL = "BTC/USDT"
@@ -180,15 +184,16 @@ def parse_setup(raw: str) -> dict:
     }
 
 
-def build_trade(setup: dict, available: list, balance: float) -> dict:
+def build_trade(setup: dict, available: list, balance: float, price=None) -> dict:
     """Считает риск, позицию, плечо и профит кодом — модель ими не управляет."""
     reason = setup["reason"]
 
     if setup["direction"] == "WAIT":
         return {"direction": "WAIT", "reason": reason or "Подходящего сетапа нет."}
 
-    # Конфлюэнция: минимум REQUIRED_FACTORS, но не больше, чем есть источников.
-    required = min(REQUIRED_FACTORS, len(available))
+    # Конфлюэнция: голосов должно хватать. Требование приходит из decide_direction,
+    # чтобы при недоступном источнике не требовать голоса, которого не существует.
+    required = setup.get("required") or min(REQUIRED_FACTORS, len(available))
     confirmed = setup["factors"] & set(available)
     if required and len(confirmed) < required:
         return {
@@ -200,14 +205,43 @@ def build_trade(setup: dict, available: list, balance: float) -> dict:
         }
 
     entry, sl, tp = setup["entry"], setup["sl"], setup["tp"]
-    spread = abs(entry - sl)
-    if entry <= 0 or spread <= 0:
+    if entry <= 0 or sl <= 0 or tp <= 0:
         return {
             "direction": "WAIT",
-            "reason": f"Модель вернула некорректные уровни (entry={entry}, sl={sl}).",
+            "reason": "Модель не дала уровни (нули) — сетапа для входа нет.",
+        }
+
+    # Уровни обязаны лежать по ту сторону входа: иначе это сетап другого
+    # направления, а направление теперь решает код, не модель.
+    direction = setup["direction"]
+    if direction == "LONG" and not (sl < entry < tp):
+        return {
+            "direction": "WAIT",
+            "reason": (
+                f"Уровни не согласованы с {direction}: вход {usd(entry)}, "
+                f"стоп {usd(sl)}, тейк {usd(tp)} — нужен стоп ниже входа, тейк выше."
+            ),
+        }
+    if direction == "SHORT" and not (tp < entry < sl):
+        return {
+            "direction": "WAIT",
+            "reason": (
+                f"Уровни не согласованы с {direction}: вход {usd(entry)}, "
+                f"стоп {usd(sl)}, тейк {usd(tp)} — нужен стоп выше входа, тейк ниже."
+            ),
+        }
+
+    if price and abs(entry - price) / price > MAX_ENTRY_DRIFT:
+        return {
+            "direction": "WAIT",
+            "reason": (
+                f"Вход {usd(entry)} вне {MAX_ENTRY_DRIFT * 100:g}% от текущей "
+                f"цены {usd(price)} — уровень взят не от рынка."
+            ),
         }
 
     atr_pct = setup.get("atr_pct")
+    spread = abs(entry - sl)
     if atr_pct is not None and atr_pct < MIN_ATR_PCT:
         return {
             "direction": "WAIT",
@@ -308,39 +342,101 @@ def format_trade(trade: dict) -> str:
             f"1:{PREFERRED_RR:g}, прибыль на максимуме."
         )
     lines += [
+        f"🧮 Направление по голосам: {trade['votes']}",
         f"✅ Факторы: {factors}",
         f"💡 Причина: {trade['reason']}",
     ]
     return "\n".join(lines)
 
 
-def build_system_prompt(available: list, balance: float) -> str:
+def decide_direction(context: dict) -> dict:
+    """Направление и объяснение считает код: конфлюэнция голосов, не мнение.
+
+    Возвращает {"direction", "reason", "confirmed"}. Новости в счёт не идут:
+    они не голосуют числом, а доверять их оценке модели — ровно то, из-за чего
+    вердикт прыгал с LONG на WAIT и обратно.
+    """
+    scores = context.get("scores") or {}
+    available = set(context.get("available") or [])
+    numeric = {name: score for name, score in scores.items() if name != "news"}
+
+    bulls = sorted(name for name, score in numeric.items() if score > 0 and name in available)
+    bears = sorted(name for name, score in numeric.items() if score < 0 and name in available)
+    calm = sorted(name for name, score in numeric.items() if score == 0 and name in available)
+
+    required = min(REQUIRED_FACTORS, len(numeric))
+    summary = (
+        f"Быки: {', '.join(bulls) or 'нет'}. "
+        f"Медведи: {', '.join(bears) or 'нет'}. "
+        f"Нейтрально: {', '.join(calm) or 'нет'}."
+    )
+
+    if required and len(bulls) >= required and not bears:
+        return {
+            "direction": "LONG",
+            "reason": summary,
+            "confirmed": set(bulls),
+            "required": required,
+        }
+    if required and len(bears) >= required and not bulls:
+        return {
+            "direction": "SHORT",
+            "reason": summary,
+            "confirmed": set(bears),
+            "required": required,
+        }
+
+    return {
+        "direction": "WAIT",
+        "reason": (
+            f"Направление не определено: {summary} "
+            f"Нужно {required} голоса одного направления из "
+            f"{len(numeric)} считающихся факторов."
+        ),
+        "confirmed": set(),
+        "required": required,
+    }
+
+
+def build_system_prompt(direction: str, available: list, balance: float, price=None) -> str:
+    """Модель подбирает уровни под направление, которое уже решил код."""
     percent = risk_percent(balance)
+    price_line = (
+        f"Текущая цена: {usd(price)}. "
+        "Вход не далее 1.5% от неё.\n"
+        if price
+        else ""
+    )
     return (
-        "Ты — строгий финансовый аналитик и алгоритмический трейдер.\n"
+        "Ты — трейдер, подбирающий уровни под решение системы.\n"
+        f"- Направление: {direction}. Его определил код по голосам факторов "
+        "и оно НЕ обсуждается: не меняй его на WAIT и не переворачивай.\n"
+        "- Если считаешь, что рынок идёт в другую сторону — всё равно дай "
+        "уровни для указанного направления или поставь все нули.\n\n"
         f"- Баланс: {usd(balance)}.\n"
         f"- Риск на сделку: {percent:g}% ({usd(balance * percent / 100)}).\n"
-        f"- Risk/Reward: жёсткий минимум 1:{MIN_RR:g}, но приоритет — максимум "
+        f"- Risk/Reward: жёсткий минимум 1:{MIN_RR:g}, приоритет — максимум "
         f"прибыли. Целись в 1:{PREFERRED_RR:g} и дальше (1:8–1:10), пока уровень "
         "реально существует на графике. Не срезай TP ради вероятности попадания.\n"
         "- Размер позиции, плечо и риск считает система — ты их не указываешь.\n\n"
+        + price_line +
         "Доступные источники: " + ", ".join(available) + ".\n\n"
-        "Правила:\n"
-        "- Подтверждай фактор ТОЛЬКО если его блок есть в данных и реально "
-        "поддерживает сетап.\n"
-        f"- Если подтверждено меньше {REQUIRED_FACTORS} факторов — direction: WAIT.\n"
-        "- Уровни задавай от структуры рынка (уровни, EMA, ATR, стенки), не выдумывай.\n"
-        f"- Стоп не ближе {min_stop_pct(balance):.2f}% от цены входа: при более "
-        f"тесном стопе позиция упрётся в потолок плеча {MAX_LEVERAGE:g}x, "
-        "риск будет меньше бюджета, а профит ниже возможного.\n"
+        "Правила для уровней:\n"
+        "- entry — ближайший реальный уровень из данных (стенки, EMA, "
+        "экстремумы свечей), не выдумывай.\n"
+        f"- стоп за ближайшим сильным уровнем, но не ближе "
+        f"{min_stop_pct(balance):.2f}% от цены входа: при более тесном стопе "
+        f"позиция упрётся в потолок плеча {MAX_LEVERAGE:g}x, риск будет меньше "
+        "бюджета, а профит ниже возможного.\n"
+        "- tp — следующий реальный уровень в направлении сделки.\n"
         "- Не придумывай уровни, которых нет в данных.\n"
-        "- Пиши поле reason строго на русском языке.\n\n"
+        "- Пиши поле reason строго на русском языке и упомяни, что решение о "
+        "направлении принято голосами факторов.\n\n"
         "Ответь СТРОГО одним JSON-объектом, без markdown и пояснений вокруг:\n"
-        '{"direction": "LONG|SHORT|WAIT", "entry": <число>, "sl": <число>, '
+        f'{{"direction": "{direction}", "entry": <число>, "sl": <число>, '
         '"tp": <число>, "confirmed_factors": ["orderbook","derivatives",'
         '"technicals","news"], "reason": "<2-3 предложения>"}\n'
-        "Если сетапа нет — direction: WAIT, entry/sl/tp = 0, "
-        "confirmed_factors = []."
+        "Если сетапа нет — направление ОСТАВЬ тем же, а entry/sl/tp = 0."
     )
 
 
@@ -560,14 +656,36 @@ async def analyze(progress=None) -> dict:
             "raw": "",
         }
 
+    decision = decide_direction(context)
+    if decision["direction"] == "WAIT":
+        # Голосов не набралось — запрос к модели не нужен: её субъективное
+        # мнение и давало перевороты направления за минуту.
+        trade = {"direction": "WAIT", "reason": decision["reason"]}
+        log_signal(trade, context)
+        return {
+            "kind": "wait",
+            "score": register_verdict("wait"),
+            "text": format_trade(trade),
+            "trade": trade,
+            "context": context,
+            "raw": "",
+        }
+
     if progress:
-        await progress(f"🧠 Анализирую через {GROQ_MODEL}...")
+        await progress(
+            f"🧠 Подбираю уровни для {decision['direction']} через {GROQ_MODEL}..."
+        )
 
     try:
         response = await groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
-                {"role": "system", "content": build_system_prompt(context["available"], BALANCE)},
+                {"role": "system", "content": build_system_prompt(
+                    decision["direction"],
+                    context["available"],
+                    BALANCE,
+                    context.get("price"),
+                )},
                 {"role": "user", "content": context["text"]},
             ],
             temperature=0.05,
@@ -590,7 +708,17 @@ async def analyze(progress=None) -> dict:
     try:
         setup = parse_setup(raw)
         setup["atr_pct"] = context["atr_pct"]
-        trade = build_trade(setup, context["available"], BALANCE)
+        # Направление, факторы и требование конфлюэнции уже решил код —
+        # ответ модели их не может изменить.
+        setup["direction"] = decision["direction"]
+        setup["factors"] = decision["confirmed"]
+        setup["required"] = decision["required"]
+        trade = build_trade(
+            setup, context["available"], BALANCE, context.get("price")
+        )
+        trade["votes"] = decision["reason"]
+        if trade["direction"] == "WAIT":
+            trade["reason"] = f"{trade['reason']}\n{decision['reason']}"
     except (ValueError, json.JSONDecodeError) as exc:
         log.warning("не удалось разобрать ответ модели: %s | raw=%s", exc, raw)
         trade = {"direction": "PARSE_ERROR", "reason": str(exc)}

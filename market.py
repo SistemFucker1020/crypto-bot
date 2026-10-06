@@ -191,36 +191,63 @@ BINANCE_DEPTH = _spot_depth(BINANCE_SPOT)
 MEXC_DEPTH = _spot_depth(MEXC_SPOT)
 
 
-async def get_orderbook(session, symbol, limit=50, top=20, wall_usd=1_000_000):
-    """Стакан: суммарный объём сторон, дисбаланс, крупные стенки."""
+async def get_orderbook(
+    session, symbol, limit=500, top=20, wall_usd=1_000_000, band=0.002
+):
+    """Стакан: объём в полосе, дисбаланс по полосе, крупные стенки.
+
+    Дисбаланс считается по полосе ±band вокруг середины книги, а не по
+    первым 20 уровням. Замер показал, что топ-20 на BTC даёт $60-1300 на
+    уровне и метается с 99% до 4% доли быков за 24 секунды (амплитуда
+    77,5 п.п.), а глубина в полосе ±0.2% меняется максимум на 8,5 п.п.
+    Старое измерение и переворачивало вердикт.
+    """
     raw = await _with_fallback(
         [
             ("binance", lambda: BINANCE_DEPTH(session, symbol, limit)),
             ("bybit", lambda: _bybit_depth(session, symbol, limit)),
-            ("mexc", lambda: MEXC_DEPTH(session, symbol, limit)),
+            # MEXC принимает максимум 50 уровней — больше отдаст ошибку.
+            ("mexc", lambda: MEXC_DEPTH(session, symbol, min(limit, 50))),
             ("okx", lambda: _okx_books(session, symbol, limit)),
         ]
     )
     if "error" in raw:
         return raw
 
-    bids = raw["bids"][:top]
-    asks = raw["asks"][:top]
+    bids, asks = raw["bids"], raw["asks"]
     if not bids and not asks:
         return {"error": f"{raw['source']}: пустой стакан"}
 
-    bid_usd = sum(p * q for p, q in bids)
-    ask_usd = sum(p * q for p, q in asks)
+    # Середина книги — по лучшим ценам, чтобы не зависеть от порядка
+    # уровней в ответе: OKX и Binance отдают их по-разному.
+    best_bid = max(price for price, _ in bids)
+    best_ask = min(price for price, _ in asks)
+    mid = (best_bid + best_ask) / 2
+
+    low, high = mid * (1 - band), mid * (1 + band)
+    near_bids = [(p, q) for p, q in bids if p >= low]
+    near_asks = [(p, q) for p, q in asks if p <= high]
+
+    bid_usd = sum(p * q for p, q in near_bids)
+    ask_usd = sum(p * q for p, q in near_asks)
     total = bid_usd + ask_usd
 
-    walls = [{"side": "BUY", "price": p, "usd": p * q} for p, q in bids if p * q >= wall_usd]
-    walls += [{"side": "SELL", "price": p, "usd": p * q} for p, q in asks if p * q >= wall_usd]
+    # Стенки берём с первых ближайших к середине уровней.
+    nearest_bids = sorted(bids, key=lambda row: -row[0])[:top]
+    nearest_asks = sorted(asks, key=lambda row: row[0])[:top]
+    walls = [
+        {"side": "BUY", "price": p, "usd": p * q} for p, q in nearest_bids if p * q >= wall_usd
+    ]
+    walls += [
+        {"side": "SELL", "price": p, "usd": p * q} for p, q in nearest_asks if p * q >= wall_usd
+    ]
     walls.sort(key=lambda w: -w["usd"])
 
     return {
         "source": raw["source"],
         "bid_usd": round(bid_usd),
         "ask_usd": round(ask_usd),
+        "band_pct": round(band * 100, 2),
         "imbalance_pct": round(bid_usd / total * 100, 1) if total else 0.0,
         "walls": walls[:5],
     }
@@ -485,6 +512,112 @@ async def get_news(session, limit=6):
 
 # --- Сборка контекста -----------------------------------------------------
 
+# --- Голоса факторов ------------------------------------------------------
+# Направление считает код, а не модель: при одном и том же рынке нейросеть
+# за минуту успевала ответить LONG, потом WAIT и снова LONG — три полных
+# расчёта с одинаковым риском в разные стороны. Числа не мнение меняют.
+
+def _orderbook_vote(block: dict) -> int:
+    """Доля быков в полосе ±0.2% книги. Мёртвая зона ±6% вокруг равновесия.
+
+    Замер на живом рынке: полоса меняется на 8,5 п.п. за полминуты, топ-20 —
+    на 77,5 п.п., поэтому пороги взяты с запасом от шума измерения.
+    """
+    share = block.get("imbalance_pct")
+    if share is None:
+        return 0
+    if share >= 56.0:
+        return 1
+    if share <= 44.0:
+        return -1
+    return 0
+
+
+def _derivatives_vote(block: dict) -> int:
+    """Funding и лонг/шорт — контр-трендовые: перегрев лонгов против лонга."""
+    votes = []
+
+    funding = block.get("funding_pct")
+    if funding is not None:
+        if funding >= 0.003:
+            votes.append(-1)   # лонги перегреты и платят за удержание
+        elif funding <= -0.003:
+            votes.append(1)    # перегреты шорты — против толпы вниз
+
+    long_pct, short_pct = block.get("long_pct"), block.get("short_pct")
+    if long_pct is not None and short_pct is not None:
+        crowd = long_pct - short_pct
+        if crowd >= 15:
+            votes.append(-1)
+        elif crowd <= -15:
+            votes.append(1)
+    elif block.get("ls_ratio") is not None:
+        ratio = block["ls_ratio"]
+        if ratio >= 1.15:
+            votes.append(-1)
+        elif ratio <= 0.85:
+            votes.append(1)
+
+    if not votes:
+        return 0
+    total = sum(votes)
+    return 1 if total > 0 else -1 if total < 0 else 0
+
+
+def _technicals_vote(block: dict) -> int:
+    """Порядок EMA 20/50/200 и зона RSI на 15m и 1h."""
+    votes = []
+    for frame in ("15m", "1h"):
+        data = block.get(frame) or {}
+        if "close" not in data:
+            continue
+        close = data["close"]
+        levels = (data.get("ema20"), data.get("ema50"), data.get("ema200"))
+        if all(level is not None for level in levels):
+            ema20, ema50, ema200 = levels
+            if close > ema20 > ema50 > ema200:
+                votes.append(1)
+            elif close < ema20 < ema50 < ema200:
+                votes.append(-1)
+            else:
+                votes.append(0)
+        rsi = data.get("rsi14")
+        if rsi is not None:
+            votes.append(1 if rsi >= 55 else -1 if rsi <= 45 else 0)
+
+    if not votes:
+        return 0
+    total = sum(votes)
+    # Без явного перевеса тренд считаем нейтральным: полумеры как раз и
+    # давали ложную уверенность, из-за которой вердикт мотало.
+    if total >= 2:
+        return 1
+    if total <= -2:
+        return -1
+    return 0
+
+
+def score_factors(blocks: dict, available: list) -> dict:
+    """Голос каждого фактора: +1 вверх, -1 вниз, 0 нейтрально.
+
+    Новости не голосуют: их смысл не сводится к числу, а субъективная
+    оценка заголовков моделью как раз переворачивала направление.
+    """
+    scorers = {
+        "orderbook": _orderbook_vote,
+        "derivatives": _derivatives_vote,
+        "technicals": _technicals_vote,
+    }
+    scores = {}
+    for name in available:
+        block = blocks.get(name)
+        if name not in scorers or not isinstance(block, dict):
+            scores[name] = 0
+            continue
+        scores[name] = scorers[name](block)
+    return scores
+
+
 def _fmt(value, digits=2):
     if value is None:
         return "n/a"
@@ -536,8 +669,10 @@ async def build_market_context(symbol="BTC/USDT"):
     if "orderbook" in available:
         block = blocks["orderbook"]
         lines.append(f"Источник: {block['source'].title()}")
-        lines.append(f"Объём заявок на покупку: ${block['bid_usd']:,}")
-        lines.append(f"Объём заявок на продажу: ${block['ask_usd']:,}")
+        lines.append(
+            f"Объём заявок в полосе ±{block.get('band_pct', 0.2):g}% "
+            f"(покупка ${block['bid_usd']:,} / продажа ${block['ask_usd']:,})"
+        )
         lines.append(f"Дисбаланс (доля быков): {block['imbalance_pct']}%")
         if block["walls"]:
             lines.append("Крупные стенки (>$1M):")
@@ -597,17 +732,29 @@ async def build_market_context(symbol="BTC/USDT"):
 
     lines.append("")
     lines.append(f"Доступные факторы: {', '.join(available) or 'нет данных'}")
+    scores = score_factors(blocks, available)
+    if scores:
+        lines.append(
+            "Голоса системы (+1 вверх / -1 вниз / 0 нейтрально): "
+            + ", ".join(f"{name} {scores[name]:+d}" for name in scores)
+        )
 
     atr_pct = None
+    price = None
     if "technicals" in available:
         technicals = blocks["technicals"]
         atr_pct = technicals.get("15m", {}).get("atr_pct")
         if atr_pct is None:
             atr_pct = technicals.get("1h", {}).get("atr_pct")
+        price = technicals.get("15m", {}).get("close")
+        if price is None:
+            price = technicals.get("1h", {}).get("close")
 
     return {
         "text": "\n".join(lines),
         "available": available,
         "atr_pct": atr_pct,
+        "price": price,
+        "scores": scores,
         "errors": errors,
     }
