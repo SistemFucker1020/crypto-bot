@@ -17,6 +17,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:   # ручной запуск: Actions → Держать бота живым → Run
+  # Диагностика: если расписание молчит, этот триггер показывает, работают
+  # ли Actions вообще. Срабатывает только на правку самого workflow.
+  push:
+    branches: [main]
+    paths: [".github/workflows/keep-alive.yml"]
 
 jobs:
   ping:
