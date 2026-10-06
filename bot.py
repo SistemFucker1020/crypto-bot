@@ -63,6 +63,16 @@ CONFIRM_WINDOW_SEC = int(os.getenv("CONFIRM_WINDOW_SEC", "3600"))
 # Вход модели не далее 1.5% от текущей цены — иначе уровни не от рынка.
 MAX_ENTRY_DRIFT = float(os.getenv("MAX_ENTRY_DRIFT", "0.015"))
 
+# Пинг из GitHub Actions ходит на /health: если автопроверка не бегла столько
+# минут — ответ 503, job падает, GitHub присылает письмо. Пустое молчание
+# бота иначе снова осталось бы незамеченным до утра.
+HEALTH_STALE_MIN = int(os.getenv("HEALTH_STALE_MIN", "45"))
+# Чат для автосообщений, который переживает рестарт: ID бот пишет в ответе
+# на /start, его нужно один раз внести в переменную на Render.
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# Пауза перед повторным запуском long polling после сбоя сети.
+POLLING_RETRY_BASE_SEC = float(os.getenv("POLLING_RETRY_BASE_SEC", "5"))
+
 GROQ_MODEL = "openai/gpt-oss-120b"
 SYMBOL = "BTC/USDT"
 
@@ -99,15 +109,43 @@ groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 _runner = None
 _site = None
 
+# HTTP отвечает 200, даже если умерла фоновая автопроверка, — это разные вещи.
+# Поэтому отдельно помним, когда рынок смотрели в последний раз.
+_health = {
+    "started_at": time.time(),
+    "last_check_at": time.time(),
+    "last_check_kind": "startup",
+    "checks": 0,
+}
+
 
 async def handle_health_check(request):
     return web.Response(text="Bot is running!")
+
+
+async def handle_status(request):
+    """200 — автопроверка жива. 503 — процесс есть, а рынок никто не смотрит."""
+    age = time.time() - _health["last_check_at"]
+    stale = CHECK_INTERVAL_MIN > 0 and age > HEALTH_STALE_MIN * 60
+    return web.json_response(
+        {
+            "status": "stale" if stale else "ok",
+            "uptime_sec": int(time.time() - _health["started_at"]),
+            "last_check_age_sec": int(age),
+            "last_check_kind": _health["last_check_kind"],
+            "checks": _health["checks"],
+            "interval_min": CHECK_INTERVAL_MIN,
+            "stale_after_min": HEALTH_STALE_MIN if CHECK_INTERVAL_MIN > 0 else None,
+        },
+        status=503 if stale else 200,
+    )
 
 
 async def start_web_server():
     global _runner, _site
     app = web.Application()
     app.router.add_get("/", handle_health_check)
+    app.router.add_get("/health", handle_status)
     _runner = web.AppRunner(app)
     await _runner.setup()
     port = int(os.getenv("PORT", 10000))
@@ -595,7 +633,10 @@ async def start_cmd(message: Message):
         f"Риск на сделку сейчас: {percent:g}% ({usd(BALANCE * percent / 100)})\n"
         f"Фильтры: R:R от 1:{MIN_RR:g}, цель 1:{PREFERRED_RR:g} и дальше, "
         f"минимум {REQUIRED_FACTORS} фактора, "
-        f"плечо до {MAX_LEVERAGE:g}x"
+        f"плечо до {MAX_LEVERAGE:g}x\n\n"
+        f"🆔 ID этого чата: {message.chat.id}\n"
+        "Чтобы бот писал сам, даже после рестарта, добавь на Render переменную "
+        f"TELEGRAM_CHAT_ID={message.chat.id}"
     )
 
 
@@ -847,6 +888,12 @@ def note_sent(direction: str) -> None:
 
 def seed_auto_state() -> None:
     """После рестарта не повторяет сигнал, который уже был в логе."""
+    if TELEGRAM_CHAT_ID:
+        try:
+            signal_log.save_chat(int(TELEGRAM_CHAT_ID))
+            log.info("чат %s восстановлен из TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
+        except Exception:  # noqa: BLE001
+            log.exception("не удалось восстановить чат из TELEGRAM_CHAT_ID")
     try:
         direction = signal_log.last_signal_direction()
     except Exception:  # noqa: BLE001
@@ -890,7 +937,13 @@ async def broadcast(text: str) -> None:
 
 async def auto_check() -> None:
     """Одна проверка по расписанию: проанализировать и решить, слать ли."""
+    # Помним тик до вызова модели: если та зависнет, возраст пойдёт в рост,
+    # и /health честно ответит 503 вместо вечно зелёного 200.
+    _health["checks"] += 1
+    _health["last_check_at"] = time.time()
+    _health["last_check_kind"] = "running"
     result = await analyze()
+    _health["last_check_kind"] = result["kind"]
     kind = result["kind"]
 
     if kind in ("signal", "wait"):
@@ -937,23 +990,62 @@ async def auto_check() -> None:
     await broadcast(result["text"])
 
 
+def next_check_delay() -> float:
+    """Ждать до следующей проверки; падение расчёта не должно убивать цикл."""
+    try:
+        return seconds_until_next_check()
+    except Exception:  # noqa: BLE001
+        log.exception("не удалось вычислить время следующей проверки")
+        return max(CHECK_INTERVAL_MIN, 1) * 60
+
+
 async def scheduler() -> None:
-    """Фоновая задача: проверяет рынок по расписанию, пока жив процесс."""
+    """Фоновая задача: проверяет рынок по расписанию, пока жив процесс.
+
+    Тело цикла целиком под try: задача не должна умереть молча — иначе
+    веб-сервер продолжит отвечать 200, а сигналы просто перестанут ходить.
+    """
     log.info(
         "автопроверка включена: каждые %s мин (+%s с после закрытия свечи)",
         CHECK_INTERVAL_MIN,
         CHECK_DELAY_SEC,
     )
     while True:
-        delay = seconds_until_next_check()
+        delay = next_check_delay()
         log.info("следующая автопроверка через %.1f мин", delay / 60)
-        await asyncio.sleep(delay)
         try:
+            await asyncio.sleep(delay)
             await auto_check()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
-            log.exception("автопроверка упала")
+            # Цикл не прерываем: следующий круг сам выждет ближайшую границу
+            # интервала, поэтому падение не ускоряет и не сдвигает проверки.
+            log.exception("автопроверка упала — жду следующего интервала")
+
+
+async def run_polling() -> None:
+    """Держит long polling живым: сбой сети не должен убивать процесс.
+
+    Без этого любая ошибка Telegram вылетала бы из main() и процесс
+    завершался бы вместе с веб-сервером — Render получил бы 5xx, и бот
+    лежал бы до ручного рестарта.
+    """
+    delay = POLLING_RETRY_BASE_SEC
+    while True:
+        started = time.monotonic()
+        try:
+            await dp.start_polling(bot)
+            log.warning("polling завершился сам — перезапускаю")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("polling упал, перезапуск через %.0f с", delay)
+        # Долго прожил — значит, дело было не в токене, обнуляем backoff.
+        if time.monotonic() - started > 120:
+            delay = POLLING_RETRY_BASE_SEC
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 60)
 
 
 async def main():
@@ -969,7 +1061,7 @@ async def main():
         _background_tasks.add(asyncio.create_task(scheduler()))
     else:
         log.info("автопроверка выключена: CHECK_INTERVAL_MIN=0")
-    await dp.start_polling(bot)
+    await run_polling()
 
 
 if __name__ == "__main__":
