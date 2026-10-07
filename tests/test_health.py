@@ -176,8 +176,88 @@ async def test_polling_survives():
 
 def test_chat_restore():
     bot.seed_auto_state()
-    check("чат восстановлен из TELEGRAM_CHAT_ID",
-          int(os.environ["TELEGRAM_CHAT_ID"]) in signal_log.chats(), str(signal_log.chats()))
+    restored = bot.env_chat_ids()
+    check("чаты из переменной окружения разобраны", restored == [-1001234567890], str(restored))
+    check("чат восстановлен из переменной окружения",
+          all(signal_log.is_subscribed(cid) for cid in restored), str(signal_log.all_chats()))
+
+
+def test_subscription():
+    for cid, _ in list(signal_log.all_chats()):
+        signal_log.unsubscribe(cid)
+
+    signal_log.save_chat(111)
+    check("/start подписывает чат", signal_log.is_subscribed(111), str(signal_log.all_chats()))
+    check("chats() отдаёт только подписанных",
+          signal_log.chats() == [cid for cid, on in signal_log.all_chats() if on],
+          str(signal_log.chats()))
+
+    check("/signals off выключает", signal_log.unsubscribe(111) is True)
+    check("выключенный чат убран из рассылки", not signal_log.is_subscribed(111))
+    check("выключенный чат виден в статусе",
+          [(cid, on) for cid, on in signal_log.all_chats() if cid == 111] == [(111, False)],
+          str(signal_log.all_chats()))
+    check("повторный off не считается ошибкой", signal_log.unsubscribe(111) is False)
+    check("незнакомый чат в off -> False", signal_log.unsubscribe(222) is False)
+
+    signal_log.subscribe(111)
+    check("/signals on включает снова", signal_log.is_subscribed(111) and 111 in signal_log.chats())
+    rows_111 = [cid for cid, _ in signal_log.all_chats() if cid == 111]
+    check("повторный on не дублирует чат",
+          rows_111 == [111], f"строк с чатом 111: {rows_111}")
+
+    # Старая база без колонки enabled должна дочитываться, а не падать.
+    import sqlite3
+    legacy = os.path.join(tempfile.gettempdir(), "legacy-chats.db")
+    if os.path.exists(legacy):
+        os.remove(legacy)
+    conn = sqlite3.connect(legacy)
+    conn.execute("CREATE TABLE chats (chat_id INTEGER PRIMARY KEY, created_at TEXT NOT NULL)")
+    conn.execute("INSERT INTO chats VALUES (42, '2026-10-01T00:00:00Z')")
+    conn.commit()
+    signal_log._ensure_enabled_column(conn)
+    has_column = {row[1] for row in conn.execute("PRAGMA table_info(chats)")}
+    enabled = conn.execute("SELECT enabled FROM chats WHERE chat_id = 42").fetchone()[0]
+    conn.close()
+    check("миграция старой базы добавляет enabled",
+          "enabled" in has_column and enabled == 1, f"{has_column} enabled={enabled}")
+
+
+async def test_signals_command():
+    sent = []
+
+    class FakeChat:
+        id = 777
+
+    class FakeMessage:
+        chat = FakeChat()
+        text = "/signals on"
+
+        async def answer(self, text):
+            sent.append(text)
+
+    msg = FakeMessage()
+    await bot.signals_cmd(msg)
+    check("/signals on включает и отвечает",
+          "Подписка включена" in sent[-1] and signal_log.is_subscribed(777), sent[-1][:80])
+
+    msg.text = "/signals off"
+    await bot.signals_cmd(msg)
+    check("/signals off выключает",
+          "выключена" in sent[-1] and not signal_log.is_subscribed(777), sent[-1][:80])
+
+    msg.text = "/signals"
+    await bot.signals_cmd(msg)
+    check("/signals без аргументов даёт статус",
+          "Чатов с подпиской" in sent[-1] and "Расписание" in sent[-1], sent[-1][:120])
+    check("статус видит выключенный чат", "Чат 777: выключена" in sent[-1], sent[-1][:200])
+
+    check("подсказка для незнакомого чата содержит переменную",
+          f"TELEGRAM_CHAT_IDS=" in bot.persistence_hint(777), bot.persistence_hint(777)[:80])
+    check("подсказка для чата из переменной — уже задана",
+          "уже задана" in bot.persistence_hint(bot.env_chat_ids()[0]),
+          bot.persistence_hint(bot.env_chat_ids()[0])[:80])
+    signal_log.unsubscribe(777)
 
 
 async def test_start_command():
@@ -196,7 +276,9 @@ async def test_start_command():
     await bot.start_cmd(FakeMessage())
     text = sent[0] if sent else ""
     check("/start показывает ID чата", str(chat_id) in text, text[-160:])
-    check("/start подсказывает TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID=" in text)
+    check("/start упоминает /signals", "/signals" in text, text[-200:])
+    check("/start даёт строку переменной или подтверждение",
+          "TELEGRAM_CHAT_IDS=" in text or "уже задана" in text, text[-200:])
 
 
 async def main():
@@ -206,6 +288,8 @@ async def main():
     await test_scheduler_survives()
     await test_polling_survives()
     test_chat_restore()
+    test_subscription()
+    await test_signals_command()
     await test_start_command()
     print("---")
     print("провалено: " + (", ".join(failures) if failures else "ничего"))

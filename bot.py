@@ -67,9 +67,21 @@ MAX_ENTRY_DRIFT = float(os.getenv("MAX_ENTRY_DRIFT", "0.015"))
 # минут — ответ 503, job падает, GitHub присылает письмо. Пустое молчание
 # бота иначе снова осталось бы незамеченным до утра.
 HEALTH_STALE_MIN = int(os.getenv("HEALTH_STALE_MIN", "45"))
-# Чат для автосообщений, который переживает рестарт: ID бот пишет в ответе
-# на /start, его нужно один раз внести в переменную на Render.
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# Чаты для автосообщений, которые переживают рестарт: бот пишет готовую строку
+# в ответе на /signals, её нужно один раз внести в переменную на Render.
+# Список через запятую или точку с запятой: "123456,-100789". Старое имя
+# TELEGRAM_CHAT_ID читаем тоже, чтобы вчерашняя настройка не потерялась.
+TELEGRAM_CHAT_IDS = os.getenv("TELEGRAM_CHAT_IDS") or os.getenv("TELEGRAM_CHAT_ID") or ""
+
+
+def env_chat_ids() -> list:
+    """Чаты из переменной окружения; чужой мусор молча пропускаем."""
+    ids = []
+    for chunk in TELEGRAM_CHAT_IDS.replace(";", ",").split(","):
+        chunk = chunk.strip()
+        if chunk.lstrip("-").isdigit():
+            ids.append(int(chunk))
+    return ids
 # Пауза перед повторным запуском long polling после сбоя сети.
 POLLING_RETRY_BASE_SEC = float(os.getenv("POLLING_RETRY_BASE_SEC", "5"))
 
@@ -628,15 +640,114 @@ async def start_cmd(message: Message):
         "👋 Привет! Я крипто-аналитик.\n"
         "Отправь /predict — соберу стакан, деривативы, индикаторы и новости, "
         "и дам торговый сетап.\n"
-        "📜 /history — прошлые сигналы и что из них вышло.\n\n"
+        "📜 /history — прошлые сигналы и что из них вышло.\n"
+        "📡 /signals — подписка на автосигналы: вкл/выкл/статус.\n\n"
         f"Баланс: {usd(BALANCE)}\n"
         f"Риск на сделку сейчас: {percent:g}% ({usd(BALANCE * percent / 100)})\n"
         f"Фильтры: R:R от 1:{MIN_RR:g}, цель 1:{PREFERRED_RR:g} и дальше, "
         f"минимум {REQUIRED_FACTORS} фактора, "
         f"плечо до {MAX_LEVERAGE:g}x\n\n"
-        f"🆔 ID этого чата: {message.chat.id}\n"
-        "Чтобы бот писал сам, даже после рестарта, добавь на Render переменную "
-        f"TELEGRAM_CHAT_ID={message.chat.id}"
+        f"📡 Подписка: {subscription_state(message.chat.id)}\n"
+        f"🆔 ID чата: {message.chat.id}\n"
+        f"{persistence_hint(message.chat.id)}"
+    )
+
+
+def subscription_state(chat_id) -> str:
+    """Короткий статус чата для ответов бота."""
+    try:
+        if signal_log.is_subscribed(chat_id):
+            return "включена ✅"
+        known = any(cid == chat_id for cid, _ in signal_log.all_chats())
+        return "выключена 🔕" if known else "не подключена"
+    except Exception:  # noqa: BLE001
+        log.exception("не удалось получить статус подписки")
+        return "статус недоступен"
+
+
+def persistence_hint(chat_id) -> str:
+    """Готовая строка для дашборда Render — подписка переживает деплой."""
+    known = env_chat_ids()
+    if chat_id in known:
+        return "✅ TELEGRAM_CHAT_IDS уже задана — подписка переживёт любой деплой."
+    merged = ",".join(str(item) for item in dict.fromkeys([*known, chat_id]))
+    return (
+        "⚠️ Деплой Render стирает базу чатов. Чтобы подписка переживала рестарт, "
+        "добавь на Render переменную\n"
+        f"TELEGRAM_CHAT_IDS={merged}\n"
+        "(Environment → Environment Variables → Save, бот перезапустится сам)."
+    )
+
+
+@dp.message(Command("signals", "подписка"))
+async def signals_cmd(message: Message):
+    """Подписка на автосигналы: /signals on | off | статус без аргумента."""
+    parts = (message.text or "").split()
+    arg = parts[1].lower() if len(parts) > 1 else ""
+    chat_id = message.chat.id
+
+    if arg in ("on", "вкл", "enable", "start"):
+        try:
+            signal_log.subscribe(chat_id)
+        except Exception:  # noqa: BLE001
+            log.exception("не удалось включить подписку чата %s", chat_id)
+            await message.answer("❌ Не получилось включить подписку, подробности в логе.")
+            return
+        await message.answer(
+            "✅ Подписка включена — сигналы будут приходить сами.\n"
+            f"Чат: {chat_id}\n"
+            f"Условие отправки: {CONFIRM_REQUIRED} одинаковых направления за "
+            f"{CONFIRM_WINDOW_SEC // 60} мин, повтор не чаще {REPEAT_SIGNAL_SEC // 60} мин.\n"
+            f"Проверка рынка: каждые {CHECK_INTERVAL_MIN} мин "
+            f"(+{CHECK_DELAY_SEC} с после закрытия свечи).\n\n"
+            f"{persistence_hint(chat_id)}"
+        )
+        return
+
+    if arg in ("off", "выкл", "disable", "stop"):
+        try:
+            known = any(cid == chat_id for cid, _ in signal_log.all_chats())
+            was_on = signal_log.unsubscribe(chat_id)
+        except Exception:  # noqa: BLE001
+            log.exception("не удалось выключить подписку чата %s", chat_id)
+            await message.answer("❌ Не получилось выключить подписку, подробности в логе.")
+            return
+        if was_on:
+            await message.answer(
+                f"🔕 Подписка выключена для чата {chat_id}.\n"
+                "Включить снова: /signals on"
+            )
+        elif known:
+            await message.answer(
+                f"Чат {chat_id} и так не подписан. Включить: /signals on"
+            )
+        else:
+            await message.answer(
+                f"Чат {chat_id} не подписан. Включить: /signals on"
+            )
+        return
+
+    # Без аргументов — статус.
+    try:
+        pairs = signal_log.all_chats()
+    except Exception:  # noqa: BLE001
+        log.exception("не удалось получить чаты")
+        pairs = []
+    active = [cid for cid, enabled in pairs if enabled]
+    state = subscription_state(chat_id)
+    env_set = bool(env_chat_ids())
+    await message.answer(
+        "📡 Подписка на сигналы\n\n"
+        f"Чат {chat_id}: {state}\n"
+        f"Чатов с подпиской: {len(active)} из {len(pairs)}\n\n"
+        f"Расписание: каждые {CHECK_INTERVAL_MIN} мин (+{CHECK_DELAY_SEC} с после свечи)\n"
+        f"Подтверждение: {CONFIRM_REQUIRED} направления за {CONFIRM_WINDOW_SEC // 60} мин\n"
+        f"Повтор сигнала: не чаще {REPEAT_SIGNAL_SEC // 60} мин\n"
+        f"Факторы: минимум {REQUIRED_FACTORS}, встречный голос запрещает\n"
+        f"Автовосстановление: "
+        f"{'TELEGRAM_CHAT_IDS задана ✅' if env_set else 'TELEGRAM_CHAT_IDS не задана ⚠️'}\n\n"
+        "/signals on — включить, /signals off — выключить\n"
+        f"{'' if env_set else persistence_hint(chat_id)}"
     )
 
 
@@ -888,12 +999,19 @@ def note_sent(direction: str) -> None:
 
 def seed_auto_state() -> None:
     """После рестарта не повторяет сигнал, который уже был в логе."""
-    if TELEGRAM_CHAT_ID:
-        try:
-            signal_log.save_chat(int(TELEGRAM_CHAT_ID))
-            log.info("чат %s восстановлен из TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
-        except Exception:  # noqa: BLE001
-            log.exception("не удалось восстановить чат из TELEGRAM_CHAT_ID")
+    restored = env_chat_ids()
+    if restored:
+        for chat_id in restored:
+            try:
+                signal_log.subscribe(chat_id)
+            except Exception:  # noqa: BLE001
+                log.exception("не удалось восстановить подписку чата %s", chat_id)
+        log.info("подписки восстановлены из TELEGRAM_CHAT_IDS: %s", restored)
+    else:
+        log.warning(
+            "TELEGRAM_CHAT_IDS не задана — после каждого деплоя подписку "
+            "придётся включать заново командой /signals on"
+        )
     try:
         direction = signal_log.last_signal_direction()
     except Exception:  # noqa: BLE001

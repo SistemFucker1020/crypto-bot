@@ -119,28 +119,83 @@ def total() -> int:
 _CHATS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS chats (
     chat_id INTEGER PRIMARY KEY,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1
 )
 """
 
 
+def _ensure_enabled_column(conn) -> None:
+    """Старая база (без enabled) дочитывается миграцией, а не падением."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(chats)")}
+    if "enabled" not in columns:
+        conn.execute("ALTER TABLE chats ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+
+
+def _open_chats_conn():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute(_CHATS_SCHEMA)
+    _ensure_enabled_column(conn)
+    return conn
+
+
 def save_chat(chat_id) -> None:
-    """Запоминает чат, куда можно слать автосигналы. Повтор — не ошибка."""
-    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
-        conn.execute(_CHATS_SCHEMA)
+    """Запоминает чат (/start). Уже отключённый чат отключённым и остаётся."""
+    with closing(_open_chats_conn()) as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO chats (chat_id, created_at) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO chats (chat_id, created_at, enabled) VALUES (?, ?, 1)",
             (int(chat_id), now_iso()),
         )
         conn.commit()
 
 
+def subscribe(chat_id) -> None:
+    """Включает подписку (/signals on): создаёт чат или снова включает."""
+    with closing(_open_chats_conn()) as conn:
+        conn.execute(
+            "INSERT INTO chats (chat_id, created_at, enabled) VALUES (?, ?, 1) "
+            "ON CONFLICT(chat_id) DO UPDATE SET enabled = 1",
+            (int(chat_id), now_iso()),
+        )
+        conn.commit()
+
+
+def unsubscribe(chat_id) -> bool:
+    """Выключает подписку (/signals off). True — чат был подписан и теперь выключен."""
+    with closing(_open_chats_conn()) as conn:
+        cursor = conn.execute(
+            "UPDATE chats SET enabled = 0 WHERE chat_id = ? AND enabled = 1",
+            (int(chat_id),),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
 def chats() -> list:
-    """Чаты, куда рассылать автопроверку."""
-    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
-        conn.execute(_CHATS_SCHEMA)
-        rows = conn.execute("SELECT chat_id FROM chats ORDER BY chat_id").fetchall()
+    """Чаты, куда рассылать автопроверку, — только с включённой подпиской."""
+    with closing(_open_chats_conn()) as conn:
+        rows = conn.execute(
+            "SELECT chat_id FROM chats WHERE enabled = 1 ORDER BY chat_id"
+        ).fetchall()
     return [row[0] for row in rows]
+
+
+def all_chats() -> list:
+    """[(chat_id, enabled)] — для статуса подписки в /signals."""
+    with closing(_open_chats_conn()) as conn:
+        rows = conn.execute(
+            "SELECT chat_id, enabled FROM chats ORDER BY chat_id"
+        ).fetchall()
+    return [(row[0], bool(row[1])) for row in rows]
+
+
+def is_subscribed(chat_id) -> bool:
+    """Подключён ли этот чат к рассылке."""
+    with closing(_open_chats_conn()) as conn:
+        row = conn.execute(
+            "SELECT enabled FROM chats WHERE chat_id = ?", (int(chat_id),)
+        ).fetchone()
+    return bool(row) and bool(row[0])
 
 
 def last_signal_direction():
