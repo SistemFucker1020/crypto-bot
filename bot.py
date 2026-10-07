@@ -82,6 +82,12 @@ def env_chat_ids() -> list:
         if chunk.lstrip("-").isdigit():
             ids.append(int(chunk))
     return ids
+
+
+# Результат проверки чатов из переменной: chat_id -> "ok" | BAD_CHAT | "не проверен".
+# Заполняется при старте restore_subscriptions(), читает /signals и подсказка.
+_env_status: dict = {}
+BAD_CHAT = "не найден"
 # Пауза перед повторным запуском long polling после сбоя сети.
 POLLING_RETRY_BASE_SEC = float(os.getenv("POLLING_RETRY_BASE_SEC", "5"))
 
@@ -666,8 +672,12 @@ def subscription_state(chat_id) -> str:
 
 
 def persistence_hint(chat_id) -> str:
-    """Готовая строка для дашборда Render — подписка переживает деплой."""
-    known = env_chat_ids()
+    """Готовая строка для дашборда Render — подписка переживает деплой.
+
+    Чаты, которые Telegram не нашёл при старте, в подсказку не попадают —
+    иначе бот советовал бы скопировать в переменную мусор.
+    """
+    known = [cid for cid in env_chat_ids() if _env_status.get(cid) != BAD_CHAT]
     if chat_id in known:
         return "✅ TELEGRAM_CHAT_IDS уже задана — подписка переживёт любой деплой."
     merged = ",".join(str(item) for item in dict.fromkeys([*known, chat_id]))
@@ -744,8 +754,7 @@ async def signals_cmd(message: Message):
         f"Подтверждение: {CONFIRM_REQUIRED} направления за {CONFIRM_WINDOW_SEC // 60} мин\n"
         f"Повтор сигнала: не чаще {REPEAT_SIGNAL_SEC // 60} мин\n"
         f"Факторы: минимум {REQUIRED_FACTORS}, встречный голос запрещает\n"
-        f"Автовосстановление: "
-        f"{'TELEGRAM_CHAT_IDS задана ✅' if env_set else 'TELEGRAM_CHAT_IDS не задана ⚠️'}\n\n"
+        f"{env_status_line()}\n\n"
         "/signals on — включить, /signals off — выключить\n"
         f"{'' if env_set else persistence_hint(chat_id)}"
     )
@@ -999,19 +1008,6 @@ def note_sent(direction: str) -> None:
 
 def seed_auto_state() -> None:
     """После рестарта не повторяет сигнал, который уже был в логе."""
-    restored = env_chat_ids()
-    if restored:
-        for chat_id in restored:
-            try:
-                signal_log.subscribe(chat_id)
-            except Exception:  # noqa: BLE001
-                log.exception("не удалось восстановить подписку чата %s", chat_id)
-        log.info("подписки восстановлены из TELEGRAM_CHAT_IDS: %s", restored)
-    else:
-        log.warning(
-            "TELEGRAM_CHAT_IDS не задана — после каждого деплоя подписку "
-            "придётся включать заново командой /signals on"
-        )
     try:
         direction = signal_log.last_signal_direction()
     except Exception:  # noqa: BLE001
@@ -1020,6 +1016,79 @@ def seed_auto_state() -> None:
     if direction:
         # Время считаем «сейчас»: после перезапуска дубль не нужен.
         note_sent(direction)
+
+
+async def restore_subscriptions() -> None:
+    """Поднимает подписки из переменной окружения и отсеивает чужие ID.
+
+    Переменную на Render заполняют руками, поэтому в неё с легкостью
+    попадает опечатка или ID, скопированный из чужого лога: такой чат
+    подписываем только после того, как Telegram подтвердил его наличие.
+    Сетевая ошибка — не приговор: чат подписывается всё равно, статус
+    остаётся «не проверен», чтобы обрыв связи не лишил пользователя сигналов.
+    """
+    ids = env_chat_ids()
+    if not ids:
+        log.warning(
+            "TELEGRAM_CHAT_IDS не задана — после каждого деплоя подписку "
+            "придётся включать заново командой /signals on"
+        )
+        return
+
+    restored = []
+    for chat_id in ids:
+        try:
+            await bot.get_chat(chat_id)
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc).lower()
+            if any(word in message for word in (
+                "chat not found",
+                "peer_id_invalid",
+                "user is deactivated",
+                "bot was blocked",
+            )):
+                _env_status[chat_id] = BAD_CHAT
+                log.warning(
+                    "чат %s из TELEGRAM_CHAT_IDS не существует в Telegram — "
+                    "подписку не восстанавливаю, убери его из переменной",
+                    chat_id,
+                )
+                continue
+            _env_status[chat_id] = "не проверен"
+            log.warning(
+                "не удалось проверить чат %s (%s) — восстанавливаю без проверки",
+                chat_id,
+                exc,
+            )
+        else:
+            _env_status[chat_id] = "ok"
+
+        try:
+            signal_log.subscribe(chat_id)
+        except Exception:  # noqa: BLE001
+            log.exception("не удалось восстановить подписку чата %s", chat_id)
+            continue
+        restored.append(chat_id)
+
+    log.info("подписки восстановлены: %s (проверка: %s)", restored, dict(_env_status))
+
+
+def env_status_line() -> str:
+    """Строка про переменную окружения с проверкой каждого чата внутри неё."""
+    ids = env_chat_ids()
+    if not ids:
+        return "Автовосстановление: TELEGRAM_CHAT_IDS не задана ⚠️"
+    parts = []
+    for cid in ids:
+        status = _env_status.get(cid)
+        if status == "ok":
+            parts.append(f"{cid} ✅")
+        elif status == BAD_CHAT:
+            parts.append(f"{cid} ❌ {BAD_CHAT}")
+        else:
+            parts.append(f"{cid} … не проверен")
+    tail = "; убери их из переменной" if BAD_CHAT in (_env_status.get(cid) for cid in ids) else ""
+    return f"Автовосстановление: TELEGRAM_CHAT_IDS задана ✅\n{', '.join(parts)}{tail}"
 
 
 def seconds_until_next_check(moment=None) -> float:
@@ -1169,6 +1238,11 @@ async def run_polling() -> None:
 async def main():
     await start_web_server()
     seed_auto_state()
+    try:
+        # Проверка ID через Telegram — не дольше 25 с, чтобы старт не завис.
+        await asyncio.wait_for(restore_subscriptions(), timeout=25)
+    except Exception:  # noqa: BLE001
+        log.exception("подписки из TELEGRAM_CHAT_IDS восстановить не удалось")
     log.info(
         "Бот запущен: баланс %s, риск %s%%, модель %s",
         usd(BALANCE),

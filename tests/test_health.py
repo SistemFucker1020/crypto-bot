@@ -174,12 +174,68 @@ async def test_polling_survives():
     check("polling пережил три обрыва и не умер", calls["n"] >= 4, f"вызовов: {calls['n']}")
 
 
-def test_chat_restore():
-    bot.seed_auto_state()
-    restored = bot.env_chat_ids()
-    check("чаты из переменной окружения разобраны", restored == [-1001234567890], str(restored))
-    check("чат восстановлен из переменной окружения",
-          all(signal_log.is_subscribed(cid) for cid in restored), str(signal_log.all_chats()))
+async def test_chat_restore():
+    class FakeBot:
+        """get_chat отвечает «chat not found» только для чатов из bad."""
+
+        bad: set = set()
+
+        async def get_chat(self, chat_id):
+            if chat_id in self.bad:
+                raise RuntimeError("Bad Request: chat not found")
+            return chat_id
+
+    fake = FakeBot()
+    original_bot = bot.bot
+    original_env = bot.TELEGRAM_CHAT_IDS
+    bot.bot = fake
+    try:
+        for cid, _ in list(signal_log.all_chats()):
+            signal_log.unsubscribe(cid)
+
+        await bot.restore_subscriptions()
+        restored = bot.env_chat_ids()
+        check("чаты из переменной окружения разобраны", restored == [-1001234567890], str(restored))
+        check("чат восстановлен после проверки в Telegram",
+              all(signal_log.is_subscribed(cid) for cid in restored), str(signal_log.all_chats()))
+        check("результат проверки запомнен",
+              bot._env_status.get(-1001234567890) == "ok", str(bot._env_status))
+
+        # Мусорный ID в переменной: Telegram говорит «нет такого чата».
+        bot.TELEGRAM_CHAT_IDS = "-1001234567890,424242"
+        fake.bad = {424242}
+        signal_log.unsubscribe(-1001234567890)
+        await bot.restore_subscriptions()
+        check("несуществующий чат не подписывается",
+              not signal_log.is_subscribed(424242) and signal_log.is_subscribed(-1001234567890),
+              str(signal_log.all_chats()))
+        check("мусорный ID помечен как несуществующий",
+              bot._env_status.get(424242) == bot.BAD_CHAT, str(bot._env_status))
+        check("подсказка не советует мусорный ID",
+              "424242" not in bot.persistence_hint(777), bot.persistence_hint(777)[:130])
+        check("подсказка для чата из переменной — уже задана",
+              "уже задана" in bot.persistence_hint(-1001234567890),
+              bot.persistence_hint(-1001234567890)[:80])
+        check("статус /signals показывает несуществующий чат",
+              "424242 ❌ не найден" in bot.env_status_line(), bot.env_status_line())
+
+        # Обрыв сети — не приговор: подписка ставится, статус «не проверен».
+        bot.TELEGRAM_CHAT_IDS = "777"
+
+        async def unreachable(chat_id):
+            raise OSError("Temporary failure in name resolution")
+
+        fake.get_chat = unreachable
+        signal_log.unsubscribe(777)
+        await bot.restore_subscriptions()
+        check("сетевая ошибка не отменяет подписку",
+              signal_log.is_subscribed(777) and bot._env_status.get(777) == "не проверен",
+              str(bot._env_status))
+    finally:
+        bot.bot = original_bot
+        bot.TELEGRAM_CHAT_IDS = original_env
+        bot._env_status.clear()
+        signal_log.unsubscribe(777)
 
 
 def test_subscription():
@@ -287,7 +343,7 @@ async def main():
     await test_real_http()
     await test_scheduler_survives()
     await test_polling_survives()
-    test_chat_restore()
+    await test_chat_restore()
     test_subscription()
     await test_signals_command()
     await test_start_command()
