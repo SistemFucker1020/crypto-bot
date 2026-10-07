@@ -1,0 +1,12 @@
+[Unit]
+Description=Пинг crypto-bot на Render (держит сервис живым)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bash /home/admin/keepalive/keepalive.sh
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target
