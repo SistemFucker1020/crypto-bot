@@ -15,7 +15,10 @@ INTERVAL=240
 
 ping_once() {
     local target="$1" raw
-    raw=$(timeout 40 curl -sS --connect-timeout 10 --max-time 30 \
+    # --max-time 120: холодный старт Render занимает 60–90 с. При старом
+    # лимите 30 с пинг отваливался раньше, чем сервис успевал подняться,
+    # — ответа не было, и Render засыпал снова, бот молчал часами.
+    raw=$(timeout 130 curl -sS --connect-timeout 15 --max-time 120 \
              -o "$BODY" -w "%{http_code}" "$target" 2>/dev/null || true)
     case "$raw" in
         [0-9][0-9][0-9]) printf '%s' "$raw" ;;
@@ -27,6 +30,12 @@ while true; do
     code=$(ping_once "$URL")
     if [ "$code" = "404" ]; then
         code=$(ping_once "$FALLBACK")
+    fi
+    # Ноль — сервис спал и просыпался не с первого раза: бьём повторно
+    # сразу, а не через INTERVAL: каждая пропущенная минута — это молчание
+    # бота в Telegram.
+    if [ "$code" = "000" ]; then
+        code=$(ping_once "$URL")
     fi
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) HTTP $code $(head -c 160 "$BODY" 2>/dev/null | tr -d '\n')" >>"$LOG"
     # Лог не разрастается: держим последние 1500 строк.
