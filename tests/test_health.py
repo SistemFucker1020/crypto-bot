@@ -316,6 +316,230 @@ async def test_signals_command():
     signal_log.unsubscribe(777)
 
 
+def test_bybit_helpers():
+    payload = "1700000000000my_key5000symbol=BTCUSDT&side=Buy"
+    check("подпись Bybit — HMAC-SHA256 по правилу биржи",
+          bot.bybit.sign(payload, "secret123")
+          == "b0a55adcaae86138f6e15eb09706559680dfd582536de4f3de4b1f178f28b020",
+          bot.bybit.sign(payload, "secret123"))
+
+    check("стоп лонга округляется вниз (не к входу)",
+          bot.bybit.round_down(84254.45, 0.1) == 84254.4,
+          str(bot.bybit.round_down(84254.45, 0.1)))
+    check("стоп шорта округляется вверх",
+          bot.bybit.round_up(84254.45, 0.1) == 84254.5,
+          str(bot.bybit.round_up(84254.45, 0.1)))
+    check("число уходит без хвостовых нулей", bot.bybit.num(0.01200) == "0.012",
+          bot.bybit.num(0.01200))
+
+    info = {"step": 0.001, "min_qty": 0.001, "min_notional": 5.0}
+    qty, problem = bot.bybit.build_qty(0.01193, 84254.4, info)
+    check("количество режется вниз до шага лота",
+          problem is None and qty == 0.011, f"{qty} {problem}")
+    qty, problem = bot.bybit.build_qty(0.0004, 84254.4, info)
+    check("объём меньше шага лота отклоняется с причиной",
+          qty is None and "шага лота" in problem, problem or "")
+    qty, problem = bot.bybit.build_qty(0.001, 1.0, info)
+    check("объём меньше минимума биржи отклоняется",
+          qty is None and "минимума биржи" in problem, problem or "")
+
+
+async def test_paper_trading():
+    bybit = bot.bybit
+    names = (
+        "enabled", "mode", "positions", "instrument_info", "ticker_price",
+        "set_leverage", "open_position", "closed_pnl", "wallet_balance",
+        "cancel_all", "close_position",
+    )
+    original = {name: getattr(bybit, name) for name in names}
+    previous_setting = signal_log.get_setting("paper")
+    calls = {"leverage": [], "orders": [], "closed": []}
+
+    trade = {
+        "direction": "LONG", "entry": 84000.0, "sl": 83500.0, "tp": 86500.0,
+        "size": 0.0119, "leverage": 5.0,
+    }
+
+    async def no_positions():
+        return []
+
+    async def one_position():
+        return [{
+            "side": "Buy", "size": 0.011, "entry": 84000.0, "mark": 84100.0,
+            "leverage": 5.0, "value": 924.0, "pnl": 1.0, "liq": 0.0,
+            "sl": 83500.0, "tp": 86500.0,
+        }]
+
+    async def info():
+        return {"min_qty": 0.001, "step": 0.001, "min_notional": 5.0, "tick": 0.1}
+
+    async def price():
+        return 84254.4
+
+    async def set_lev(leverage):
+        calls["leverage"].append(leverage)
+
+    async def open_pos(side, qty, entry, sl, tp, tick=0.1):
+        calls["orders"].append((side, qty, entry, sl, tp, tick))
+        return "OID-777"
+
+    async def deals(limit=20):
+        return [{
+            "pnl": 12.5, "side": "Buy", "qty": 0.011, "entry": 84000.0,
+            "exit": 86000.0, "fee": 0.1, "closed_at": 1791371662000,
+            "reason": "Market",
+        }]
+
+    async def wallet():
+        return {"equity": 100.0, "wallet": 100.0, "available": 80.0,
+                "account_type": "UNIFIED"}
+
+    async def cancel():
+        calls["closed"].append("cancel")
+
+    async def close():
+        calls["closed"].append("close")
+
+    bybit.enabled = lambda: True
+    bybit.mode = lambda: "testnet"
+    bybit.positions = no_positions
+    bybit.instrument_info = info
+    bybit.ticker_price = price
+    bybit.set_leverage = set_lev
+    bybit.open_position = open_pos
+    bybit.closed_pnl = deals
+    bybit.wallet_balance = wallet
+    bybit.cancel_all = cancel
+    bybit.close_position = close
+
+    try:
+        signal_log.set_setting("paper", "off")
+        note = await bot.place_paper_order(trade)
+        check("paper trading выключен — ордер не ставится",
+              note == "" and not calls["orders"], note)
+
+        signal_log.set_setting("paper", "on")
+        note = await bot.place_paper_order(trade)
+        check("подтверждённый сигнал даёт ордер",
+              "Ордер выставлен" in note and "OID-777" in note,
+              note.replace("\n", " | "))
+        check("плечо выставлено до входа", calls["leverage"] == [5.0],
+              str(calls["leverage"]))
+        check("в ордер ушло посчитанное количество",
+              calls["orders"][0][1] == 0.011, str(calls["orders"]))
+        check("ордер записан в журнал",
+              bool(signal_log.positions_log(1))
+              and signal_log.positions_log(1)[0]["order_id"] == "OID-777",
+              str(signal_log.positions_log(1)))
+
+        bybit.positions = one_position
+        note = await bot.place_paper_order(trade)
+        check("при открытой позиции второй ордер не ставится",
+              "уже открыта" in note, note)
+        bybit.positions = no_positions
+
+        async def far_price():
+            return 90000.0
+
+        bybit.ticker_price = far_price
+        note = await bot.place_paper_order(trade)
+        check("цена ушла дальше лимита — вход блокируется",
+              "ушла" in note, note)
+        bybit.ticker_price = price
+
+        async def broken(*args, **kwargs):
+            raise bybit.BybitError("Margin is insufficient")
+
+        bybit.open_position = broken
+        note = await bot.place_paper_order(trade)
+        check("ошибка биржи попадает в сообщение, а не роняет сигнал",
+              "не выставлен" in note and "Margin" in note, note)
+        bybit.open_position = open_pos
+
+        stats = await bot.paper_stats()
+        check("/stats получает реализованный PnL с биржи",
+              "Реализованный PnL" in stats and "$12.50" in stats,
+              stats.replace("\n", " | "))
+
+        sent = []
+
+        class FakeChat:
+            id = 777
+
+        class FakeMessage:
+            chat = FakeChat()
+            text = "/paper"
+
+            async def answer(self, text):
+                sent.append(text)
+
+        message = FakeMessage()
+        await bot.paper_cmd(message)
+        check("/paper без аргументов показывает статус",
+              "Paper trading" in sent[-1] and "Режим" in sent[-1],
+              sent[-1][:130])
+
+        message.text = "/paper off"
+        await bot.paper_cmd(message)
+        check("/paper off выключает и запоминает",
+              signal_log.get_setting("paper") == "off" and "выключен" in sent[-1],
+              sent[-1][:100])
+
+        message.text = "/paper on"
+        await bot.paper_cmd(message)
+        check("/paper on включает", signal_log.get_setting("paper") == "on")
+
+        message.text = "/positions"
+        await bot.positions_cmd(message)
+        check("/positions показывает позиции, сделки и журнал",
+              "Открытых позиций нет" in sent[-1]
+              and "Последние закрытые" in sent[-1]
+              and "Журнал ордеров" in sent[-1], sent[-1][:250])
+
+        class FakeCallbackMessage:
+            def __init__(self):
+                self.texts = []
+
+            async def answer(self, text):
+                self.texts.append(text)
+
+        class FakeCallback:
+            def __init__(self):
+                self.alerts = []
+                self.sent_message = FakeCallbackMessage()
+
+            async def answer(self, text=None, show_alert=False):
+                self.alerts.append(text)
+
+            @property
+            def message(self):
+                return self.sent_message
+
+        bybit.positions = one_position
+        callback = FakeCallback()
+        await bot.close_position_cb(callback)
+        check("кнопка снимает ордера и закрывает позицию",
+              calls["closed"] == ["cancel", "close"]
+              and callback.sent_message.texts
+              and "закрыта" in callback.sent_message.texts[0],
+              f"{calls['closed']} {callback.sent_message.texts}")
+        check("закрытие показывает реализованный PnL",
+              "$12.50" in callback.sent_message.texts[0],
+              str(callback.sent_message.texts))
+        bybit.positions = no_positions
+
+        bybit.enabled = lambda: False
+        callback = FakeCallback()
+        await bot.close_position_cb(callback)
+        check("без ключей кнопка отвечает отказом",
+              callback.alerts and "не заданы" in callback.alerts[0],
+              str(callback.alerts))
+    finally:
+        for name in names:
+            setattr(bybit, name, original[name])
+        signal_log.set_setting("paper", previous_setting or "off")
+
+
 async def test_start_command():
     sent = []
     chat_id = int(os.environ["TELEGRAM_CHAT_ID"])
@@ -333,6 +557,8 @@ async def test_start_command():
     text = sent[0] if sent else ""
     check("/start показывает ID чата", str(chat_id) in text, text[-160:])
     check("/start упоминает /signals", "/signals" in text, text[-200:])
+    check("/start упоминает /paper и /positions",
+          "/paper" in text and "/positions" in text, text[-260:])
     check("/start даёт строку переменной или подтверждение",
           "TELEGRAM_CHAT_IDS=" in text or "уже задана" in text, text[-200:])
 
@@ -346,6 +572,8 @@ async def main():
     await test_chat_restore()
     test_subscription()
     await test_signals_command()
+    test_bybit_helpers()
+    await test_paper_trading()
     await test_start_command()
     print("---")
     print("провалено: " + (", ".join(failures) if failures else "ничего"))

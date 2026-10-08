@@ -74,6 +74,92 @@ _COLUMNS = (
 # Направления, которые мы вообще пишем в базу.
 DIRECTIONS = ("LONG", "SHORT", "WAIT", "NODATA", "PARSE_ERROR")
 
+# Переживает рестарт настройки, которые меняют сами пользователи (/paper).
+# Render стирает базу — тогда действует значение по умолчанию из окружения.
+_SETTINGS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+# Журнал выставленных ордеров: что именно биржа приняла и по какому сигналу.
+# Статус позиции бот берёт с биржи, а не отсюда — базу Render стирает.
+_POSITIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id INTEGER,
+    opened_at TEXT NOT NULL,
+    mode TEXT,
+    direction TEXT NOT NULL,
+    qty TEXT NOT NULL,
+    price REAL,
+    entry REAL,
+    sl REAL,
+    tp REAL,
+    leverage REAL,
+    order_id TEXT
+)
+"""
+
+
+def get_setting(key: str, default=None):
+    """Настройка из базы или значение по умолчанию, если её ещё не меняли."""
+    try:
+        with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+            conn.execute(_SETTINGS_SCHEMA)
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (str(key),)
+            ).fetchone()
+    except sqlite3.Error:
+        return default
+    return row[0] if row else default
+
+
+def set_setting(key: str, value) -> None:
+    """Меняет настройку. Повторная запись перетирает предыдущую."""
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+        conn.execute(_SETTINGS_SCHEMA)
+        conn.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            (str(key), str(value), now_iso()),
+        )
+        conn.commit()
+
+
+def log_position(**fields) -> int:
+    """Журнал выставленного ордера, возвращает id записи."""
+    columns = (
+        "signal_id", "opened_at", "mode", "direction", "qty",
+        "price", "entry", "sl", "tp", "leverage", "order_id",
+    )
+    values = {name: fields.get(name) for name in columns}
+    if not values["opened_at"]:
+        values["opened_at"] = now_iso()
+    placeholders = ", ".join("?" for _ in columns)
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+        conn.execute(_POSITIONS_SCHEMA)
+        cursor = conn.execute(
+            f"INSERT INTO positions ({', '.join(columns)}) VALUES ({placeholders})",
+            tuple(values[name] for name in columns),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def positions_log(limit: int = 10) -> list:
+    """Последние выставленные ордера — для /positions, когда биржа недоступна."""
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+        conn.execute(_POSITIONS_SCHEMA)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM positions ORDER BY id DESC LIMIT ?", (int(limit),)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
 
 def now_iso() -> str:
     """Момент записи с часовым поясом сервера — чтобы время было однозначным."""
