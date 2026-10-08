@@ -1108,6 +1108,7 @@ async def stats_cmd(message: Message):
 async def paper_status_text() -> str:
     """Что сейчас с paper trading: режим, ключи, баланс, позиция."""
     lines = [f"📒 Paper trading — Bybit {bybit.mode()}", ""]
+    lines.append(f"API: {bybit.BASE}")
     lines.append(
         f"Режим: {'включён ✅' if paper_enabled() else 'выключен 🔕'}"
     )

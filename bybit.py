@@ -31,8 +31,10 @@ TIMEOUT = aiohttp.ClientTimeout(total=10)
 RECV_WINDOW = "5000"
 
 TESTNET = os.getenv("BYBIT_TESTNET", "1") != "0"
-KEY = os.getenv("BYBIT_KEY", "")
-SECRET = os.getenv("BYBIT_SECRET", "")
+# .strip(): значение, скопированное в дашборд с пробелом или переводом строки,
+# ломает подпись молча — а 401 без объяснений ищется долго.
+KEY = os.getenv("BYBIT_KEY", "").strip()
+SECRET = os.getenv("BYBIT_SECRET", "").strip()
 BASE = os.getenv("BYBIT_API") or (
     "https://api-testnet.bybit.com" if TESTNET else "https://api.bybit.com"
 )
@@ -136,7 +138,28 @@ async def _request(method: str, path: str, *, params=None, body=None, signed=Fal
     async with aiohttp.ClientSession(headers=headers) as session:
         kwargs = {"data": payload} if method == "POST" else {}
         async with session.request(method, url, timeout=TIMEOUT, **kwargs) as response:
-            data = await response.json(content_type=None)
+            status = response.status
+            raw = await response.text(errors="replace")
+
+    # Ответ читаем текстом и парсим сами: иначе пустое тело от 401
+    # превращается в невнятное «Expecting property name enclosed...».
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except ValueError as exc:
+        raise BybitError(
+            f"биржа вернула не JSON (HTTP {status}), начало ответа: {raw[:200]!r}"
+        ) from exc
+
+    if status >= 400:
+        detail = data.get("retMsg") or (raw[:200] if raw.strip() else "пустое тело")
+        hint = ""
+        if status in (401, 403):
+            hint = (
+                " — ключ отклонён: проверь, что создан на том же хосте "
+                "(testnet.bybit.com ↔ api-testnet.bybit.com), что в него не "
+                "попали пробелы и что выданы права на торговлю"
+            )
+        raise BybitError(f"HTTP {status} (retCode={data.get('retCode')}): {detail}{hint}")
 
     if data.get("retCode", -1) != 0:
         raise BybitError(

@@ -317,6 +317,24 @@ async def test_signals_command():
 
 
 def test_bybit_helpers():
+    import importlib
+
+    saved = {name: os.environ.get(name) for name in ("BYBIT_KEY", "BYBIT_SECRET")}
+    try:
+        os.environ["BYBIT_KEY"] = "  key-with-spaces \n"
+        os.environ["BYBIT_SECRET"] = " secret \t"
+        importlib.reload(bot.bybit)
+        check("ключ и секрет обрезаются при старте",
+              bot.bybit.KEY == "key-with-spaces" and bot.bybit.SECRET == "secret",
+              f"{bot.bybit.KEY!r} {bot.bybit.SECRET!r}")
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        importlib.reload(bot.bybit)
+
     payload = "1700000000000my_key5000symbol=BTCUSDT&side=Buy"
     check("подпись Bybit — HMAC-SHA256 по правилу биржи",
           bot.bybit.sign(payload, "secret123")
@@ -342,6 +360,63 @@ def test_bybit_helpers():
     qty, problem = bot.bybit.build_qty(0.001, 1.0, info)
     check("объём меньше минимума биржи отклоняется",
           qty is None and "минимума биржи" in problem, problem or "")
+
+
+async def test_bybit_errors():
+    """Пустой ответ от 401 должен звучать человечески, а не как падение JSON."""
+    bybit = bot.bybit
+    original_aiohttp = bybit.aiohttp
+
+    class FakeResponse:
+        def __init__(self, status, body):
+            self.status = status
+            self._body = body
+
+        async def text(self, *, encoding=None, errors="strict"):
+            return self._body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class FakeSession:
+        def __init__(self, status, body):
+            self.status, self.body = status, body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def request(self, *args, **kwargs):
+            return FakeResponse(self.status, self.body)
+
+    class FakeAiohttp:
+        def __init__(self, status, body):
+            self.ClientSession = lambda **kwargs: FakeSession(status, body)
+
+    cases = (
+        (401, "", "HTTP 401"),
+        (401, "", "ключ отклонён"),
+        (401, "", "testnet.bybit.com"),
+        (200, "<html>oops", "не JSON"),
+        (200, '{"retCode":10001,"retMsg":"sign error, please check"}', "sign error"),
+    )
+    try:
+        for status, body, expected in cases:
+            bybit.aiohttp = FakeAiohttp(status, body)
+            try:
+                await bybit._request("GET", "/v5/diagnostic", signed=False)
+            except bybit.BybitError as exc:
+                check(f"ответ {status} → понятная ошибка: {expected[:34]}",
+                      expected in str(exc), str(exc)[:150])
+            else:
+                check(f"ответ {status} → ошибка", False, "исключение не поднято")
+    finally:
+        bybit.aiohttp = original_aiohttp
 
 
 async def test_paper_trading():
@@ -573,6 +648,7 @@ async def main():
     test_subscription()
     await test_signals_command()
     test_bybit_helpers()
+    await test_bybit_errors()
     await test_paper_trading()
     await test_start_command()
     print("---")
