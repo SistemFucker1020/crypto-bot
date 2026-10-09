@@ -14,7 +14,21 @@ from groq import AsyncGroq
 
 from market import build_market_context
 import bybit
+import okx
 import signal_log
+
+
+def pick_exchange():
+    """Какой биржей исполнять сигналы.
+
+    OKX-ключи приоритетнее: задал их — бот торгует на OKX Demo. Без них
+    остаётся Bybit, как раньше. Смена биржи — смена переменных окружения,
+    код не меняется.
+    """
+    return okx if okx.enabled() else bybit
+
+
+ex = pick_exchange()
 
 # --- Настройки окружения ----------------------------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -649,7 +663,7 @@ async def start_cmd(message: Message):
         "и дам торговый сетап.\n"
         "📜 /history — прошлые сигналы и что из них вышло.\n"
         "📡 /signals — подписка на автосигналы: вкл/выкл/статус.\n"
-        "📒 /paper — бумажная торговля на Bybit: настоящие ордера, "
+        f"📒 /paper — бумажная торговля на {ex.venue()}: настоящие ордера, "
         "фальшивые деньги.\n"
         "📗 /positions — открытые позиции и последние сделки.\n\n"
         f"Баланс: {usd(BALANCE)}\n"
@@ -772,7 +786,7 @@ def remember(message: Message) -> None:
         log.exception("не удалось запомнить чат")
 
 
-# --- Paper trading: настоящие ордера на Bybit ---------------------------
+# --- Paper trading: настоящие ордера на бирже ---------------------------
 # Включается ключами из окружения; /paper on|off переключает на лету и
 # запоминает выбор в базе. Позиция живёт на бирже, поэтому переживает
 # и рестарт процесса, и стирание файловой системы на Render.
@@ -786,8 +800,8 @@ def paper_enabled() -> bool:
     """Выставлять ли ордера на биржу. Ключи обязательны — иначе только сигнал."""
     stored = signal_log.get_setting("paper")
     if stored is None:
-        return PAPER_DEFAULT and bybit.enabled()
-    return stored == "on" and bybit.enabled()
+        return PAPER_DEFAULT and ex.enabled()
+    return stored == "on" and ex.enabled()
 
 
 async def place_paper_order(trade: dict, signal_id=None) -> str:
@@ -799,11 +813,11 @@ async def place_paper_order(trade: dict, signal_id=None) -> str:
     """
     if not paper_enabled():
         return ""
-    if not bybit.enabled():
-        return "⚠️ Paper trading включён, но ключи Bybit не заданы — ордер не выставлен."
+    if not ex.enabled():
+        return f"⚠️ Paper trading включён, но ключи {ex.venue()} не заданы — ордер не выставлен."
 
     try:
-        open_positions = await bybit.positions()
+        open_positions = await ex.positions()
     except Exception as exc:  # noqa: BLE001
         log.exception("не удалось прочитать позиции с биржи")
         return f"⚠️ Ордер не выставлен: биржа недоступна ({exc})."
@@ -816,8 +830,8 @@ async def place_paper_order(trade: dict, signal_id=None) -> str:
         )
 
     try:
-        info = await bybit.instrument_info()
-        price = await bybit.ticker_price()
+        info = await ex.instrument_info()
+        price = await ex.ticker_price()
     except Exception as exc:  # noqa: BLE001
         log.exception("не удалось получить данные биржи")
         return f"⚠️ Ордер не выставлен: данные биржи недоступны ({exc})."
@@ -829,13 +843,13 @@ async def place_paper_order(trade: dict, signal_id=None) -> str:
             f"(лимит {MAX_ENTRY_DRIFT * 100:.1f}%)."
         )
 
-    qty, problem = bybit.build_qty(trade["size"], price, info)
+    qty, problem = ex.build_qty(trade["size"], price, info)
     if problem:
         return f"⚠️ Ордер не выставлен: {problem}."
 
     try:
-        await bybit.set_leverage(trade["leverage"])
-        order_id = await bybit.open_position(
+        await ex.set_leverage(trade["leverage"])
+        order_id = await ex.open_position(
             trade["direction"], qty, trade["entry"], trade["sl"], trade["tp"], info["tick"]
         )
     except Exception as exc:  # noqa: BLE001
@@ -845,9 +859,9 @@ async def place_paper_order(trade: dict, signal_id=None) -> str:
     try:
         signal_log.log_position(
             signal_id=signal_id,
-            mode=bybit.mode(),
+            mode=ex.mode(),
             direction=trade["direction"],
-            qty=bybit.num(qty),
+            qty=ex.num(qty),
             price=price,
             entry=trade["entry"],
             sl=trade["sl"],
@@ -860,13 +874,13 @@ async def place_paper_order(trade: dict, signal_id=None) -> str:
 
     log.info(
         "ордер выставлен (%s): %s %s qty=%s вход=%s стоп=%s цель=%s плечо=%sx id=%s",
-        bybit.mode(), trade["direction"], SYMBOL, bybit.num(qty),
+        ex.mode(), trade["direction"], SYMBOL, ex.num(qty),
         trade["entry"], trade["sl"], trade["tp"], trade["leverage"], order_id,
     )
     return "\n".join(
         [
-            f"📋 Ордер выставлен на Bybit {bybit.mode()}",
-            f"Market {trade['direction']} {bybit.num(qty)} {SYMBOL.split('/')[0]} ≈ {usd(price)}",
+            f"📋 Ордер выставлен на {ex.venue()} {ex.mode()}",
+            f"Market {trade['direction']} {ex.num(qty)} {SYMBOL.split('/')[0]} ≈ {usd(price)}",
             f"Стоп {usd(trade['sl'])} · Цель {usd(trade['tp'])} · Плечо {trade['leverage']:g}x",
             f"ID: {order_id}",
         ]
@@ -875,10 +889,10 @@ async def place_paper_order(trade: dict, signal_id=None) -> str:
 
 async def paper_stats() -> str:
     """Реализованный результат с биржи — то, чего не было в /stats."""
-    if not bybit.enabled():
+    if not ex.enabled():
         return ""
     try:
-        deals = await bybit.closed_pnl(100)
+        deals = await ex.closed_pnl(100)
     except Exception as exc:  # noqa: BLE001
         log.warning("не удалось получить закрытые сделки: %s", exc)
         return ""
@@ -889,7 +903,7 @@ async def paper_stats() -> str:
     return "\n".join(
         [
             "",
-            "📈 Реальный paper trading (Bybit " + bybit.mode() + ")",
+            f"📈 Реальный paper trading ({ex.venue()} {ex.mode()})",
             f"Закрыто сделок: {len(deals)}",
             f"Прибыльных: {wins} ({wins / len(deals) * 100:.0f}%)",
             f"Реализованный PnL: {usd(total)}",
@@ -1107,18 +1121,18 @@ async def stats_cmd(message: Message):
 
 async def paper_status_text() -> str:
     """Что сейчас с paper trading: режим, ключи, баланс, позиция."""
-    lines = [f"📒 Paper trading — Bybit {bybit.mode()}", ""]
-    lines.append(f"API: {bybit.BASE}")
+    lines = [f"📒 Paper trading — {ex.venue()} {ex.mode()}", ""]
+    lines.append(f"API: {ex.BASE}")
     lines.append(
         f"Режим: {'включён ✅' if paper_enabled() else 'выключен 🔕'}"
     )
-    if not bybit.enabled():
-        lines.append("Ключи BYBIT_KEY / BYBIT_SECRET: не заданы ⚠️")
+    if not ex.enabled():
+        lines.append(f"Ключи {ex.KEY_NAMES}: не заданы ⚠️")
         lines.append("Без них бот шлёт только сигналы, ордера не ставит.")
     else:
         lines.append("Ключи: заданы ✅")
         try:
-            balance = await bybit.wallet_balance()
+            balance = await ex.wallet_balance()
             lines.append(
                 f"Баланс счёта: {usd(balance['wallet'])} "
                 f"(equity {usd(balance['equity'])}, {balance['account_type']})"
@@ -1126,7 +1140,7 @@ async def paper_status_text() -> str:
         except Exception as exc:  # noqa: BLE001
             lines.append(f"Баланс: недоступен ({exc})")
         try:
-            open_positions = await bybit.positions()
+            open_positions = await ex.positions()
         except Exception as exc:  # noqa: BLE001
             lines.append(f"Позиции: недоступны ({exc})")
         else:
@@ -1155,17 +1169,17 @@ async def paper_cmd(message: Message):
     arg = parts[1].lower() if len(parts) > 1 else ""
 
     if arg in ("on", "вкл", "enable", "start"):
-        if not bybit.enabled():
+        if not ex.enabled():
             await message.answer(
-                "❌ Ключи Bybit не заданы. Добавь на Render переменные "
-                "BYBIT_KEY и BYBIT_SECRET (тестнет: testnet.bybit.com → API), "
+                f"❌ Ключи {ex.venue()} не заданы. Добавь на Render переменные "
+                f"{ex.KEY_NAMES} ({ex.KEY_HINT}), "
                 "потом повтори /paper on."
             )
             return
         signal_log.set_setting("paper", "on")
         await message.answer(
             "✅ Paper trading включён — подтверждённый сигнал выставит ордер "
-            f"на Bybit {bybit.mode()}.\n\n" + await paper_status_text()
+            f"на {ex.venue()} {ex.mode()}.\n\n" + await paper_status_text()
         )
         return
 
@@ -1186,11 +1200,11 @@ async def positions_cmd(message: Message):
     remember(message)
     lines = ["📗 Позиции и сделки", ""]
 
-    if not bybit.enabled():
-        lines.append("Ключи Bybit не заданы — биржевая статистика недоступна.")
+    if not ex.enabled():
+        lines.append(f"Ключи {ex.venue()} не заданы — биржевая статистика недоступна.")
     else:
         try:
-            open_positions = await bybit.positions()
+            open_positions = await ex.positions()
         except Exception as exc:  # noqa: BLE001
             lines.append(f"Открытые позиции: недоступны ({exc})")
         else:
@@ -1206,7 +1220,7 @@ async def positions_cmd(message: Message):
                 lines.append("Открытых позиций нет")
 
         try:
-            deals = await bybit.closed_pnl(5)
+            deals = await ex.closed_pnl(5)
         except Exception as exc:  # noqa: BLE001
             lines.append(f"Закрытые сделки: недоступны ({exc})")
         else:
@@ -1238,11 +1252,11 @@ async def positions_cmd(message: Message):
 @dp.callback_query(F.data == "close_position")
 async def close_position_cb(callback: CallbackQuery):
     """Кнопка «Закрыть позицию» под сигналом: снимает ордера и закрывает."""
-    if not bybit.enabled():
-        await callback.answer("Ключи Bybit не заданы", show_alert=True)
+    if not ex.enabled():
+        await callback.answer(f"Ключи {ex.venue()} не заданы", show_alert=True)
         return
     try:
-        open_positions = await bybit.positions()
+        open_positions = await ex.positions()
     except Exception as exc:  # noqa: BLE001
         await callback.answer(f"Биржа недоступна: {exc}", show_alert=True)
         return
@@ -1252,15 +1266,15 @@ async def close_position_cb(callback: CallbackQuery):
 
     position = open_positions[0]
     try:
-        await bybit.cancel_all()
-        await bybit.close_position()
+        await ex.cancel_all()
+        await ex.close_position()
     except Exception as exc:  # noqa: BLE001
         log.exception("не удалось закрыть позицию")
         await callback.answer(f"Не удалось закрыть: {exc}", show_alert=True)
         return
 
     try:
-        deals = await bybit.closed_pnl(3)
+        deals = await ex.closed_pnl(3)
         last = deals[0] if deals else None
     except Exception:  # noqa: BLE001
         last = None

@@ -41,6 +41,9 @@ BASE = os.getenv("BYBIT_API") or (
 CATEGORY = "linear"      # USDT-перпетуал, как и расчёты бота с плечом
 SYMBOL = "BTCUSDT"       # bot.SYMBOL = "BTC/USDT"
 
+KEY_NAMES = "BYBIT_KEY / BYBIT_SECRET"
+KEY_HINT = "тестнет: testnet.bybit.com → API"
+
 
 class BybitError(RuntimeError):
     """Биржа ответила ошибкой или ключей нет."""
@@ -49,6 +52,11 @@ class BybitError(RuntimeError):
 def mode() -> str:
     """«testnet» или «mainnet» — для сообщений и статуса."""
     return "testnet" if TESTNET else "mainnet"
+
+
+def venue() -> str:
+    """Название биржи для сообщений: бот не должен врать, куда встал ордер."""
+    return "Bybit"
 
 
 def enabled() -> bool:

@@ -419,6 +419,173 @@ async def test_bybit_errors():
         bybit.aiohttp = original_aiohttp
 
 
+def test_okx_helpers():
+    """Выбор биржи, подпись OKX и переведённый в монеты шаг лота."""
+    import importlib
+
+    okx = bot.okx
+    check("выбранная биржа при импорте совпадает с ключами окружения",
+          bot.ex is bot.pick_exchange(), bot.ex.venue())
+
+    names = ("OKX_KEY", "OKX_SECRET", "OKX_PASSPHRASE")
+    saved = {name: os.environ.get(name) for name in names}
+    try:
+        for name in names:
+            os.environ.pop(name, None)
+        check("без OKX-ключей выбран Bybit — старый путь не тронут",
+              bot.pick_exchange() is bot.bybit, bot.pick_exchange().venue())
+        os.environ[names[0]] = "  key-with-spaces \n"
+        os.environ[names[1]] = " secret \t"
+        os.environ[names[2]] = " phrase "
+        # Модуль читает окружение при импорте — перечитываем, как при старте.
+        importlib.reload(bot.okx)
+        check("OKX-ключи приоритетнее Bybit — смена биржи это смена env",
+              bot.pick_exchange() is bot.okx, bot.pick_exchange().venue())
+        check("ключ, секрет и пароль обрезаются при старте",
+              bot.okx.KEY == "key-with-spaces" and bot.okx.SECRET == "secret"
+              and bot.okx.PASSPHRASE == "phrase",
+              f"{bot.okx.KEY!r} {bot.okx.SECRET!r} {bot.okx.PASSPHRASE!r}")
+        check("все три части ключа включают ордера", bot.okx.enabled())
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        importlib.reload(bot.okx)
+
+    prehash = "2020-12-08T09:08:57.715ZGET/api/v5/account/balance?ccy=USDT"
+    check("подпись OKX — Base64 HMAC-SHA256, а не hex, как у Bybit",
+          bot.okx.sign(prehash, "secret123")
+          == "l51I7t8mEfenB6Zvwy+zZN07TQqNf8ThkItQLm3hCvY=",
+          bot.okx.sign(prehash, "secret123"))
+
+    check("стоп лонга округляется вниз (не к входу)",
+          bot.okx.round_down(84254.45, 0.1) == 84254.4,
+          str(bot.okx.round_down(84254.45, 0.1)))
+    check("стоп шорта округляется вверх",
+          bot.okx.round_up(84254.45, 0.1) == 84254.5,
+          str(bot.okx.round_up(84254.45, 0.1)))
+    check("число уходит без хвостовых нулей", bot.okx.num(0.01200) == "0.012",
+          bot.okx.num(0.01200))
+
+    # шаг лота OKX задан в контрактах (lotSz × ctVal), бот считает монетами
+    info = {"step": 0.001, "min_qty": 0.001, "min_notional": 0.0,
+            "tick": 0.1, "ct_val": 0.01}
+    qty, problem = bot.okx.build_qty(0.01193, 84254.4, info)
+    check("количество режется вниз до шага лота",
+          problem is None and qty == 0.011, f"{qty} {problem}")
+    qty, problem = bot.okx.build_qty(0.0004, 84254.4, info)
+    check("объём меньше шага лота отклоняется с причиной",
+          qty is None and "шага лота" in problem, problem or "")
+    info["min_notional"] = 5.0
+    qty, problem = bot.okx.build_qty(0.001, 1.0, info)
+    check("объём меньше минимума биржи отклоняется",
+          qty is None and "минимума биржи" in problem, problem or "")
+
+
+async def test_okx_request():
+    """Демо-заголовок, подпись запроса и человеческие ошибки OKX."""
+    okx = bot.okx
+    original = {
+        "aiohttp": okx.aiohttp, "DEMO": okx.DEMO, "KEY": okx.KEY,
+        "SECRET": okx.SECRET, "PASSPHRASE": okx.PASSPHRASE,
+    }
+    captured = {}
+
+    class FakeResponse:
+        def __init__(self, status, body):
+            self.status = status
+            self._body = body
+
+        async def text(self, *, encoding=None, errors="strict"):
+            return self._body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class FakeSession:
+        def __init__(self, status, body, headers=None):
+            self.status, self.body = status, body
+            captured["headers"] = headers or {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def request(self, *args, **kwargs):
+            return FakeResponse(self.status, self.body)
+
+    class FakeAiohttp:
+        def __init__(self, status, body):
+            self.ClientSession = lambda **kwargs: FakeSession(status, body, **kwargs)
+
+    okx.KEY, okx.SECRET, okx.PASSPHRASE = "demo-key", "demo-secret", "demo-pass"
+    try:
+        okx.aiohttp = FakeAiohttp(200, '{"code":"0","data":[{"ccy":"USDT"}]}')
+        data = await okx._request(
+            "GET", "/api/v5/account/balance", params={"ccy": "USDT"}, signed=True
+        )
+        headers = captured["headers"]
+        check("демо-заголовок x-simulated-trading ставится",
+              headers.get("x-simulated-trading") == "1",
+              str(headers.get("x-simulated-trading")))
+        check("заголовки OKX-доступа подписаны",
+              all(key in headers for key in (
+                  "OK-ACCESS-KEY", "OK-ACCESS-SIGN",
+                  "OK-ACCESS-TIMESTAMP", "OK-ACCESS-PASSPHRASE")),
+              ",".join(sorted(headers)))
+        prehash = (
+            f"{headers['OK-ACCESS-TIMESTAMP']}GET/api/v5/account/balance?ccy=USDT"
+        )
+        check("подпись посчитана от того prehash, что ушёл на биржу",
+              headers["OK-ACCESS-SIGN"] == okx.sign(prehash, "demo-secret"),
+              headers.get("OK-ACCESS-SIGN", ""))
+        check("успех возвращает data, а не роняет запрос",
+              data == [{"ccy": "USDT"}], str(data))
+
+        okx.DEMO = False
+        await okx._request("GET", "/api/v5/market/ticker", params={"instId": "X"})
+        check("боевой режим снимает демо-заголовок",
+              "x-simulated-trading" not in captured["headers"],
+              str(captured["headers"].get("x-simulated-trading")))
+
+        cases = (
+            (401, "", "ключ отклонён"),
+            (401, "", "Demo Trading API"),
+            (200, "<html>oops", "не JSON"),
+            (200, '{"code":"50111","msg":"Incorrect passphrase"}', "50111"),
+            (200, '{"code":"50102","msg":"Timestamp exceeds limit"}', "часы"),
+        )
+        for status, body, expected in cases:
+            okx.aiohttp = FakeAiohttp(status, body)
+            try:
+                await okx._request("GET", "/api/v5/diagnostic", signed=False)
+            except okx.OkxError as exc:
+                check(f"ответ {status} → понятная ошибка: {expected[:34]}",
+                      expected in str(exc), str(exc)[:150])
+            else:
+                check(f"ответ {status} → ошибка", False, "исключение не поднято")
+
+        okx.aiohttp = FakeAiohttp(401, "")
+        okx.KEY = okx.SECRET = okx.PASSPHRASE = ""
+        try:
+            await okx._request("GET", "/api/v5/diagnostic", signed=True)
+        except okx.OkxError as exc:
+            check("без ключей подписной запрос падает с именами переменных",
+                  "OKX_KEY" in str(exc), str(exc)[:120])
+        else:
+            check("без ключей подписной запрос падает", False, "не поднято")
+    finally:
+        for name, value in original.items():
+            setattr(okx, name, value)
+
+
 async def test_paper_trading():
     bybit = bot.bybit
     names = (
@@ -428,6 +595,10 @@ async def test_paper_trading():
     )
     original = {name: getattr(bybit, name) for name in names}
     previous_setting = signal_log.get_setting("paper")
+    # Фейки ставим на модуль Bybit — значит и биржа в тесте должна быть им.
+    # Это независимо от ключей в окружении: тесты не ходят в сеть.
+    previous_exchange = bot.ex
+    bot.ex = bybit
     calls = {"leverage": [], "orders": [], "closed": []}
 
     trade = {
@@ -612,6 +783,7 @@ async def test_paper_trading():
     finally:
         for name in names:
             setattr(bybit, name, original[name])
+        bot.ex = previous_exchange
         signal_log.set_setting("paper", previous_setting or "off")
 
 
@@ -649,6 +821,8 @@ async def main():
     await test_signals_command()
     test_bybit_helpers()
     await test_bybit_errors()
+    test_okx_helpers()
+    await test_okx_request()
     await test_paper_trading()
     await test_start_command()
     print("---")
