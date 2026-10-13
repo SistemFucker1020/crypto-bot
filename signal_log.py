@@ -12,6 +12,7 @@
 с ботом, здесь — рабочая копия для анализа.
 """
 
+import json
 import os
 import sqlite3
 from contextlib import closing
@@ -69,7 +70,49 @@ _COLUMNS = (
     "balance",
     "reason",
     "raw",
+    # --- Качество сигнала (миграция внизу: старая база дочитывается) ---
+    "timeframe",          # таймфрейм свечи, под которой собран сигнал
+    "candle_close_at",    # закрытие этой свечи (формирование, без будущих данных)
+    "formed_at",          # момент формирования сигнала
+    "expires_at",         # TTL: срок действия сигнала
+    "sent_at",            # момент отправки в чат
+    "score",              # сила сетапа 0-100 (НЕ вероятность успеха)
+    "score_breakdown",    # json: вклад каждой группы факторов
+    "coverage",           # доля веса факторов с реальными данными
+    "regime",             # режим рынка (TREND/RANGE/...)
+    "regime_flags",       # json: признаки волатильности/новостного риска
+    "snapshot",           # json: снимок рынка на момент формирования
+    "costs",              # json: комиссии/funding/slippage (оценка)
+    "gross_planned",      # плановая валовая прибыль
+    "net_planned",        # плановая чистая (за вычетом оценки издержек)
+    "status",             # sent|manual|cancelled|expired|score_blocked|regime_blocked
+    "status_reason",      # причина отмены/блокировки
+    "recheck",            # json: результат повторной проверки перед отправкой
 )
+
+# Добавление колонок в существующую таблицу. Удалений нет — история цела.
+_SIGNAL_COLUMNS_DDL = {
+    "timeframe": "TEXT",
+    "candle_close_at": "TEXT",
+    "formed_at": "TEXT",
+    "expires_at": "TEXT",
+    "sent_at": "TEXT",
+    "score": "REAL",
+    "score_breakdown": "TEXT",
+    "coverage": "REAL",
+    "regime": "TEXT",
+    "regime_flags": "TEXT",
+    "snapshot": "TEXT",
+    "costs": "TEXT",
+    "gross_planned": "REAL",
+    "net_planned": "REAL",
+    "status": "TEXT",
+    "status_reason": "TEXT",
+    "recheck": "TEXT",
+}
+
+# Эти поля храним как json-строки; принимаем и готовую строку, и dict.
+_JSON_COLUMNS = frozenset({"score_breakdown", "regime_flags", "snapshot", "costs", "recheck"})
 
 # Направления, которые мы вообще пишем в базу.
 DIRECTIONS = ("LONG", "SHORT", "WAIT", "NODATA", "PARSE_ERROR")
@@ -166,6 +209,25 @@ def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def _ensure_signals_columns(conn) -> None:
+    """Миграция signals: добавляет недостающие колонки, ничего не удаляя.
+
+    Старая база (до TTL/Score/режима) читается и пишется как обычно —
+    новые колонки просто появляются с NULL, прошлые записи не перетираются.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(signals)")}
+    for name, ddl in _SIGNAL_COLUMNS_DDL.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE signals ADD COLUMN {name} {ddl}")
+
+
+def _open_signals_conn() -> None:
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute(_SCHEMA)
+    _ensure_signals_columns(conn)
+    return conn
+
+
 def record(**fields) -> int:
     """Пишет одну запись, возвращает её id. Таблицу создаёт при первом вызове."""
     values = {name: fields.get(name) for name in _COLUMNS}
@@ -173,10 +235,12 @@ def record(**fields) -> int:
         values["capped"] = int(bool(values["capped"]))
     if values["reason"]:
         values["reason"] = str(values["reason"])[:2000]
+    for name in _JSON_COLUMNS:
+        if isinstance(values.get(name), (dict, list, tuple)):
+            values[name] = json.dumps(values[name], ensure_ascii=False)
 
     placeholders = ", ".join("?" for _ in _COLUMNS)
-    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
-        conn.execute(_SCHEMA)
+    with closing(_open_signals_conn()) as conn:
         cursor = conn.execute(
             f"INSERT INTO signals ({', '.join(_COLUMNS)}) VALUES ({placeholders})",
             tuple(values[name] for name in _COLUMNS),
@@ -185,11 +249,31 @@ def record(**fields) -> int:
         return cursor.lastrowid
 
 
+def update_status(signal_id, status: str, reason: str = "", sent_at=None) -> None:
+    """Помечает исход сигнала: отправлен, отменён, истёк, заблокирован.
+
+    Пишет только колонки статуса — снимок рынка, score и уровни в записи
+    остаются ровно теми, что были в момент формирования.
+    """
+    if not signal_id:
+        return
+    try:
+        with closing(_open_signals_conn()) as conn:
+            conn.execute(
+                "UPDATE signals SET status = ?, status_reason = ?, sent_at = "
+                "COALESCE(?, sent_at) WHERE id = ?",
+                (str(status), str(reason or "")[:2000], sent_at, int(signal_id)),
+            )
+            conn.commit()
+    except sqlite3.Error:
+        # Статус не критичен для работы бота: сигнал уже отправлен/отменён.
+        pass
+
+
 def recent(limit: int = 8) -> list:
     """Последние записи, новые первыми."""
-    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+    with closing(_open_signals_conn()) as conn:
         conn.row_factory = sqlite3.Row
-        conn.execute(_SCHEMA)
         rows = conn.execute(
             "SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
@@ -197,8 +281,7 @@ def recent(limit: int = 8) -> list:
 
 
 def total() -> int:
-    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
-        conn.execute(_SCHEMA)
+    with closing(_open_signals_conn()) as conn:
         return conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
 
 
@@ -285,28 +368,40 @@ def is_subscribed(chat_id) -> bool:
 
 
 def last_signal_direction():
-    """Направление последнего LONG/SHORT — чтобы не слать дубль после рестарта."""
-    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
-        conn.execute(_SCHEMA)
+    """Направление последнего ОТПРАВЛЕННОГО LONG/SHORT — не слать дубль.
+
+    Заблокированные (score/regime) и отменённые записи не считаются:
+    сигнал, который не дошёл до чата, не должен подавлять повтор того же
+    направления после рестарта.
+    """
+    with closing(_open_signals_conn()) as conn:
         row = conn.execute(
             "SELECT direction FROM signals "
             "WHERE direction IN ('LONG', 'SHORT') "
+            "AND (status IS NULL OR status IN ('sent', 'manual', 'formed')) "
             "ORDER BY id DESC LIMIT 1"
         ).fetchone()
     return row[0] if row else None
 
 
 def stats() -> dict:
-    """Сводка по сигналам: сколько сделок, средний профит, доля прибыльных."""
-    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
-        conn.execute(_SCHEMA)
+    """Сводка по сигналам: сколько сделок, средний профит, доля прибыльных.
+
+    Разделяем сформированные LONG/SHORT, отправленные, отменённые и
+    заблокированные записи. Плановые суммы (gross/net) — оценка, а не
+    реализованный результат: его даёт только /stats через закрытые сделки.
+    """
+    with closing(_open_signals_conn()) as conn:
         row = conn.execute(
             """
             SELECT COUNT(*) AS signals,
                    AVG(profit_usd) AS avg_profit,
                    SUM(profit_usd) AS total_profit,
                    AVG(stop_pct) AS avg_stop,
-                   AVG(rr) AS avg_rr
+                   AVG(rr) AS avg_rr,
+                   AVG(gross_planned) AS avg_gross,
+                   AVG(net_planned) AS avg_net,
+                   AVG(score) AS avg_score
             FROM signals
             WHERE direction IN ('LONG', 'SHORT')
             """
@@ -314,11 +409,29 @@ def stats() -> dict:
         waits = conn.execute(
             "SELECT COUNT(*) FROM signals WHERE direction = 'WAIT'"
         ).fetchone()[0]
+        counts = {
+            status: conn.execute(
+                "SELECT COUNT(*) FROM signals WHERE status = ?", (status,)
+            ).fetchone()[0]
+            for status in (
+                "formed", "sent", "manual", "cancelled", "expired",
+                "score_blocked", "regime_blocked",
+            )
+        }
     return {
         "signals": row[0] or 0,
         "avg_profit": row[1],
         "total_profit": row[2],
         "avg_stop": row[3],
         "avg_rr": row[4],
+        "avg_gross": row[5],
+        "avg_net": row[6],
+        "avg_score": row[7],
         "waits": waits,
+        "sent": counts["sent"],
+        "manual": counts["manual"],
+        "cancelled": counts["cancelled"],
+        "expired": counts["expired"],
+        "score_blocked": counts["score_blocked"],
+        "regime_blocked": counts["regime_blocked"],
     }

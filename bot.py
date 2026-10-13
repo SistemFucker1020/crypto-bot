@@ -16,6 +16,10 @@ from market import build_market_context
 import bybit
 import okx
 import signal_log
+import costs
+import levels
+import regime
+import setup_score
 
 
 def pick_exchange():
@@ -77,6 +81,22 @@ CONFIRM_REQUIRED = int(os.getenv("CONFIRM_REQUIRED", "2"))
 CONFIRM_WINDOW_SEC = int(os.getenv("CONFIRM_WINDOW_SEC", "3600"))
 # Вход модели не далее 1.5% от текущей цены — иначе уровни не от рынка.
 MAX_ENTRY_DRIFT = float(os.getenv("MAX_ENTRY_DRIFT", "0.015"))
+
+# TTL сигнала: сколько сигнал считается действительным от момента
+# формирования. По умолчанию — две свечи выбранного таймфрейма; по истечении
+# сигнал уходит в журнал как expired и НЕ отправляется (не обходя подтверждение).
+TIMEFRAME = "15m"
+_TF_SEC = {"15m": 900, "1h": 3600}
+SIGNAL_TTL_SEC = {
+    tf: float(os.getenv(f"SIGNAL_TTL_{int(sec // 60)}M", str(sec * 2)))
+    for tf, sec in _TF_SEC.items()
+}
+
+# Повторная проверка перед отправкой: через RECHECK_DELAY_SEC после
+# подтверждения данные собираются заново — направление, уровни, дрейф цены
+# и Risk Engine. Не прошёл — сигнал отменяется с причиной в журнал.
+RECHECK_DELAY_SEC = float(os.getenv("RECHECK_DELAY_SEC", "10"))
+RECHECK_MAX_AGE_SEC = float(os.getenv("RECHECK_MAX_AGE_SEC", "120"))
 
 # Пинг из GitHub Actions ходит на /health: если автопроверка не бегла столько
 # минут — ответ 503, job падает, GitHub присылает письмо. Пустое молчание
@@ -200,10 +220,15 @@ def min_stop_pct(balance: float) -> float:
 
     Позиция ограничена балансом × MAX_LEVERAGE, а риск = позиция × стоп.
     Значит полный бюджет достигается только при стопе не уже
-    риск% / MAX_LEVERAGE. Теснее — позиция упирается в потолок и риск
+    бюджет / MAX_LEVERAGE. Теснее — позиция упирается в потолок и риск
     (а вместе с ним и профит) оказываются ниже цели.
+
+    Бюджет здесь ЧИСТЫЙ (за вычетом оценки издержек), поэтому и стоп
+    считается от него: с учётом комиссий позиция немного меньше и в
+    потолок она упирается позже.
     """
-    return risk_percent(balance) / MAX_LEVERAGE
+    percent = min(risk_percent(balance), costs.NET_RISK_MAX_PCT)
+    return percent / MAX_LEVERAGE
 
 
 def choose_leverage(position_usd: float, balance: float) -> float:
@@ -230,10 +255,12 @@ def parse_setup(raw: str) -> dict:
     if direction not in {"LONG", "SHORT", "WAIT"}:
         raise ValueError(f"неизвестное направление: {direction!r}")
 
-    def number(key: str) -> float:
+    def number(key: str, default=None) -> float:
         try:
             return float(data.get(key))
         except (TypeError, ValueError):
+            if default is not None:
+                return default
             raise ValueError(f"поле {key} не число: {data.get(key)!r}")
 
     raw_factors = data.get("confirmed_factors") or []
@@ -248,8 +275,10 @@ def parse_setup(raw: str) -> dict:
     return {
         "direction": direction,
         "entry": number("entry"),
-        "sl": number("sl"),
-        "tp": number("tp"),
+        # SL/TP модель может прислать, но уровни считает код (levels.py):
+        # нули допустимы, они будут заменены расчётом от структуры рынка.
+        "sl": number("sl", 0.0),
+        "tp": number("tp", 0.0),
         "reason": str(data.get("reason", "")).strip(),
         "factors": factors,
     }
@@ -330,9 +359,14 @@ def build_trade(setup: dict, available: list, balance: float, price=None) -> dic
         }
 
     stop_fraction = spread / entry
-    percent = risk_percent(balance)
-    target_risk = balance * percent / 100
-    target_position = target_risk / stop_fraction
+    percent = min(risk_percent(balance), costs.NET_RISK_MAX_PCT)
+    # Бюджет чистый: издержки (комиссии+slippage+funding) считаются от
+    # номинала, поэтому позиция считается через них, а не только через
+    # долю стопа — иначе при тесном стопе чистый убыток переваливает
+    # за 5% баланса, хотя валовой риска не превышает.
+    target_risk = costs.net_budget_usd(balance, percent)
+    cost_rate = costs.cost_rate()
+    target_position = costs.position_for_budget(target_risk, stop_fraction)
 
     # Позиция ограничена потолком плеча — тогда фактический риск оказывается ниже цели.
     # Допуск 0.1% нужен из-за плавающей точки: при стопе ровно на границе
@@ -342,7 +376,11 @@ def build_trade(setup: dict, available: list, balance: float, price=None) -> dic
 
     leverage = choose_leverage(position, balance)
     actual_risk = position * stop_fraction
+    # Чистый убыток по стопу: движение цены + издержки на вход/выход.
+    net_risk = position * (stop_fraction + cost_rate)
     profit = position * abs(tp - entry) / entry
+    # Чистый результат по ЦЕЛИ — план, не факт (ставка издержек оценочная).
+    plan = costs.estimate(direction, entry, tp, position)
     size = position / entry
 
     return {
@@ -357,8 +395,12 @@ def build_trade(setup: dict, available: list, balance: float, price=None) -> dic
         "margin": position / leverage,
         "risk": actual_risk,
         "risk_pct": actual_risk / balance * 100,
+        "net_risk": net_risk,
+        "net_risk_pct": net_risk / balance * 100,
         "target_pct": percent,
         "profit": profit,
+        "net_profit": plan["net"],
+        "costs": plan,
         "sl_pct": stop_fraction * 100,
         "capped": capped,
         "balance": balance,
@@ -388,14 +430,62 @@ def format_trade(trade: dict) -> str:
         "",
         f"📊 Математика сделки (баланс {usd(trade['balance'])}, "
         f"базовый риск {trade['target_pct']:g}%):",
-        f"🔴 Возможный убыток (Риск): -{usd(trade['risk'])} "
+        f"🔴 Риск по цене (валовый): -{usd(trade['risk'])} "
         f"({trade['risk_pct']:.2f}% баланса)",
-        f"🟢 Заработок (Профит): +{usd(trade['profit'])} "
-        f"({trade['profit'] / trade['balance'] * 100:.1f}% баланса)",
+    ]
+    if trade.get("costs"):
+        est = trade["costs"]
+        lines.append(
+            f"🔴 Риск чистыми (с комиссиями, оценка): "
+            f"-{usd(trade['net_risk'])} ({trade['net_risk_pct']:.2f}% баланса)"
+        )
+        lines += [
+            f"🟢 Прибыль валовая (план): +{usd(trade['profit'])} "
+            f"({trade['profit'] / trade['balance'] * 100:.1f}% баланса)",
+            f"💚 Прибыль чистая (оценка): +{usd(trade['net_profit'])} "
+            f"({trade['net_profit'] / trade['balance'] * 100:.1f}% баланса)",
+            f"   издержки за {est['hold_hours']:g}ч удержания: комиссии {usd(est['fees'])}, "
+            f"проскальзывание {usd(est['slippage'])}, "
+            f"funding {usd(est['funding'])} — ОЦЕНКА, не факт",
+        ]
+    else:
+        lines.append(
+            f"🟢 Заработок (Профит): +{usd(trade['profit'])} "
+            f"({trade['profit'] / trade['balance'] * 100:.1f}% баланса)"
+        )
+    lines += [
         f"⚖️ Risk/Reward: 1 : {trade['rr']:.2f}",
         f"📦 Размер позиции: {trade['size']:.6f} {asset} ({usd(trade['position'])})",
         f"🔑 Плечо: {trade['leverage']:g}x (маржа {usd(trade['margin'])})",
     ]
+    if trade.get("score"):
+        score = trade["score"]
+        lines.append(
+            f"🧮 Score сетапа: {score['score']:.0f}/100 "
+            f"(покрытие данных {score['coverage']:.0%}) — сила согласованности "
+            "факторов, НЕ вероятность прибыли"
+        )
+    if trade.get("regime"):
+        flags = trade["regime"]["flags"]
+        marks = [
+            name for name, on in (
+                ("высокая волатильность", flags.get("high_volatility")),
+                ("низкая волатильность", flags.get("low_volatility")),
+                ("новостной риск", flags.get("news_event")),
+            ) if on
+        ]
+        lines.append(
+            f"🌍 Режим рынка: {trade['regime']['mode']}"
+            + (f" ({', '.join(marks)})" if marks else "")
+        )
+    if trade.get("level_notes"):
+        lines.append(f"📐 Уровни: {trade['level_notes']}")
+    if trade.get("expires_at"):
+        lines.append(
+            f"⏳ Сигнал действителен до {_stamp(trade['expires_at'])} "
+            f"(TTL {trade['ttl_sec'] // 60} мин от {_stamp(trade['formed_at'])}) "
+            f"— свеча {trade['timeframe']}"
+        )
     if trade["capped"]:
         lines.append(
             "⚠️ Позиция упёрлась в потолок плеча "
@@ -470,7 +560,11 @@ def decide_direction(context: dict) -> dict:
 
 
 def build_system_prompt(direction: str, available: list, balance: float, price=None) -> str:
-    """Модель подбирает уровни под направление, которое уже решил код."""
+    """Модель подбирает вход под направление, которое уже решил код.
+
+    Стоп и тейк модель НЕ задаёт: их считает система от реальной структуры
+    рынка (уровни, ATR, свайпы) — чтобы цель не растягивалась ради R:R.
+    """
     percent = risk_percent(balance)
     price_line = (
         f"Текущая цена: {usd(price)}. "
@@ -479,35 +573,30 @@ def build_system_prompt(direction: str, available: list, balance: float, price=N
         else ""
     )
     return (
-        "Ты — трейдер, подбирающий уровни под решение системы.\n"
+        "Ты — трейдер, подбирающий точку входа под решение системы.\n"
         f"- Направление: {direction}. Его определил код по голосам факторов "
         "и оно НЕ обсуждается: не меняй его на WAIT и не переворачивай.\n"
         "- Если считаешь, что рынок идёт в другую сторону — всё равно дай "
-        "уровни для указанного направления или поставь все нули.\n\n"
+        "вход для указанного направления или поставь entry = 0.\n\n"
         f"- Баланс: {usd(balance)}.\n"
         f"- Риск на сделку: {percent:g}% ({usd(balance * percent / 100)}).\n"
-        f"- Risk/Reward: жёсткий минимум 1:{MIN_RR:g}, приоритет — максимум "
-        f"прибыли. Целись в 1:{PREFERRED_RR:g} и дальше (1:8–1:10), пока уровень "
-        "реально существует на графике. Не срезай TP ради вероятности попадания.\n"
-        "- Размер позиции, плечо и риск считает система — ты их не указываешь.\n\n"
+        "- Стоп и тейк рассчитает СИСТЕМА от реальной структуры рынка "
+        "(поддержки/сопротивления, свайпы, ATR) — sl и tp можно указать 0.\n"
+        "- Размер позиции, плечо и риск тоже считает система — ты их не указываешь.\n\n"
         + price_line +
         "Доступные источники: " + ", ".join(available) + ".\n\n"
-        "Правила для уровней:\n"
+        "Правила для входа:\n"
         "- entry — ближайший реальный уровень из данных (стенки, EMA, "
         "экстремумы свечей), не выдумывай.\n"
-        f"- стоп за ближайшим сильным уровнем, но не ближе "
-        f"{min_stop_pct(balance):.2f}% от цены входа: при более тесном стопе "
-        f"позиция упрётся в потолок плеча {MAX_LEVERAGE:g}x, риск будет меньше "
-        "бюджета, а профит ниже возможного.\n"
-        "- tp — следующий реальный уровень в направлении сделки.\n"
+        "- Если реального уровня для входа нет — entry = 0.\n"
         "- Не придумывай уровни, которых нет в данных.\n"
         "- Пиши поле reason строго на русском языке и упомяни, что решение о "
         "направлении принято голосами факторов.\n\n"
         "Ответь СТРОГО одним JSON-объектом, без markdown и пояснений вокруг:\n"
-        f'{{"direction": "{direction}", "entry": <число>, "sl": <число>, '
-        '"tp": <число>, "confirmed_factors": ["orderbook","derivatives",'
+        f'{{"direction": "{direction}", "entry": <число>, "sl": 0, "tp": 0, '
+        '"confirmed_factors": ["orderbook","derivatives",'
         '"technicals","news"], "reason": "<2-3 предложения>"}\n'
-        "Если сетапа нет — направление ОСТАВЬ тем же, а entry/sl/tp = 0."
+        "Если сетапа нет — направление ОСТАВЬ тем же, а entry = 0."
     )
 
 
@@ -533,10 +622,19 @@ def data_report(context: dict) -> str:
 
 # --- Лог сигналов --------------------------------------------------------
 
-def log_signal(trade: dict, context: dict, raw: str = "") -> None:
-    """Пишет исход /predict в SQLite. Ошибка логирования не должна ронять бота."""
+def log_signal(trade: dict, context: dict, raw: str = "", score_info=None,
+               regime_info=None, status=None) -> int:
+    """Пишет исход проверки в SQLite. Ошибка логирования не роняет бота.
+
+    Помимо уровней и риска сохраняет полный контекст решения: TTL-времена,
+    Score с разбивкой групп, режим рынка, снимок рынка и оценку издержек —
+    чтобы любое решение можно было разобрать постфактум. status — явный
+    статус записи (formed/score_blocked/...), иначе выводится из направления.
+    """
     try:
-        signal_log.record(
+        if status is None:
+            status = "formed" if trade.get("direction") in ("LONG", "SHORT") else None
+        signal_id = signal_log.record(
             created_at=signal_log.now_iso(),
             symbol=SYMBOL,
             direction=trade.get("direction", "?"),
@@ -557,9 +655,25 @@ def log_signal(trade: dict, context: dict, raw: str = "") -> None:
             balance=trade.get("balance", BALANCE),
             reason=trade.get("reason", ""),
             raw=raw[:4000],
+            timeframe=trade.get("timeframe"),
+            candle_close_at=trade.get("candle_close_at"),
+            formed_at=trade.get("formed_at"),
+            expires_at=trade.get("expires_at"),
+            score=(score_info or {}).get("score"),
+            score_breakdown=(score_info or {}).get("breakdown"),
+            coverage=(score_info or {}).get("coverage"),
+            regime=(regime_info or trade.get("regime") or {}).get("mode"),
+            regime_flags=(regime_info or trade.get("regime") or {}).get("flags"),
+            snapshot=trade.get("snapshot"),
+            costs=trade.get("costs"),
+            gross_planned=trade.get("profit"),
+            net_planned=trade.get("net_profit"),
+            status=status,
         )
+        return signal_id
     except Exception:  # noqa: BLE001
         log.exception("не удалось записать сигнал в лог")
+        return 0
 
 
 def no_data_trade(context: dict) -> dict:
@@ -609,14 +723,24 @@ def format_history(rows: list) -> str:
 
         if direction in ("LONG", "SHORT") and row["profit_usd"] is not None:
             balance = row["balance"] or 0
+            status = row["status"] or "сформирован"
             header = f"{stamp}  🚨 {direction}  профит ${row['profit_usd']:.2f}"
             if balance:
                 header += f" ({row['profit_usd'] / balance * 100:.1f}%)"
             if row["rr"]:
                 header += f"  R:R {row['rr']:.2f}"
+            header += f"  [{status}]"
             lines.append(header)
 
             details = []
+            if row["net_planned"] is not None:
+                details.append(
+                    f"чистыми (оценка) ${row['net_planned']:.2f}"
+                )
+            if row["score"] is not None:
+                details.append(f"Score {row['score']:.0f}")
+            if row["regime"]:
+                details.append(f"режим {row['regime']}")
             if row["stop_pct"] is not None:
                 details.append(f"стоп {row['stop_pct']:.2f}%")
             if row["risk_usd"] is not None:
@@ -627,6 +751,8 @@ def format_history(rows: list) -> str:
                 details.append("упёрлась в потолок")
             if details:
                 lines.append("        " + ", ".join(details))
+            if row.get("status_reason"):
+                lines.append(f"        причина: {row['status_reason'][:90]}")
 
         elif direction == "WAIT":
             lines.append(f"{stamp}  ⏸ WAIT")
@@ -816,6 +942,16 @@ async def place_paper_order(trade: dict, signal_id=None) -> str:
     if not ex.enabled():
         return f"⚠️ Paper trading включён, но ключи {ex.venue()} не заданы — ордер не выставлен."
 
+    # TTL: по истечении срока действия сигнала ордер не ставим — уровни
+    # и решение уже устарели, входить по ним нельзя.
+    if trade.get("expires_at") and datetime.fromisoformat(
+        trade["expires_at"]
+    ) < datetime.now().astimezone():
+        return (
+            f"⏸ Ордер не выставлен: TTL сигнала истёк "
+            f"({_stamp(trade['expires_at'])}) — входить по устаревшим уровням нельзя."
+        )
+
     try:
         open_positions = await ex.positions()
     except Exception as exc:  # noqa: BLE001
@@ -888,7 +1024,12 @@ async def place_paper_order(trade: dict, signal_id=None) -> str:
 
 
 async def paper_stats() -> str:
-    """Реализованный результат с биржи — то, чего не было в /stats."""
+    """Реализованный результат с биржи — то, чего не было в /stats.
+
+    Считаются ТОЛЬКО закрытые сделки: незавершённые позиции за итог не
+    выдаются. closedPnl у бирж уже чистый (за комиссию и funding), поэтому
+    валовой PnL восстанавливается вычетом комиссии отдельно.
+    """
     if not ex.enabled():
         return ""
     try:
@@ -898,15 +1039,38 @@ async def paper_stats() -> str:
         return ""
     if not deals:
         return ""
-    total = sum(deal["pnl"] for deal in deals)
-    wins = sum(1 for deal in deals if deal["pnl"] > 0)
+    # Дела сортируем по времени закрытия — просадка считается по истории.
+    deals = sorted(deals, key=lambda deal: deal["closed_at"])
+    net_total = sum(deal["pnl"] for deal in deals)
+    # fee на бирже отрицательная (заплаченная): валовый = чистый + комиссия.
+    gross_total = sum(deal["pnl"] - deal["fee"] for deal in deals)
+    wins = [deal for deal in deals if deal["pnl"] > 0]
+    losses = [deal for deal in deals if deal["pnl"] <= 0]
+    winrate = len(wins) / len(deals) * 100
+    expectancy = net_total / len(deals)
+    gross_win = sum(deal["pnl"] - deal["fee"] for deal in wins)
+    gross_loss = abs(sum(deal["pnl"] - deal["fee"] for deal in losses))
+    profit_factor = gross_win / gross_loss if gross_loss else float("inf")
+
+    # Максимальная просадка по кривой equity закрытых сделок.
+    equity, peak, max_dd = 0.0, 0.0, 0.0
+    for deal in deals:
+        equity += deal["pnl"]
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+
     return "\n".join(
         [
             "",
             f"📈 Реальный paper trading ({ex.venue()} {ex.mode()})",
-            f"Закрыто сделок: {len(deals)}",
-            f"Прибыльных: {wins} ({wins / len(deals) * 100:.0f}%)",
-            f"Реализованный PnL: {usd(total)}",
+            f"Закрыто сделок: {len(deals)} (незавершённые не учитываются)",
+            f"Прибыльных: {len(wins)} ({winrate:.0f}%)",
+            f"Валовый PnL (до издержек): {usd(gross_total)}",
+            f"Реализованный PnL (чистый, после комиссий и funding): {usd(net_total)}",
+            f"Математическое ожидание на сделку: {usd(expectancy)}",
+            f"Profit Factor: {profit_factor:.2f}" if profit_factor != float("inf")
+            else "Profit Factor: ∞ (убыточных нет)",
+            f"Максимальная просадка: {usd(max_dd)}",
         ]
     )
 
@@ -975,9 +1139,65 @@ async def analyze(progress=None) -> dict:
             "raw": "",
         }
 
+    # Режим рынка: детерминированно, до запроса к модели. Сам по себе не
+    # блокирует — только явное правило REGIME_BLOCKS (см. regime.py).
+    market_regime = regime.detect(context)
+    log.info(
+        "режим рынка: %s (ADX %s, ATR %s%%, новости: %s)",
+        market_regime["mode"], market_regime["adx"], market_regime["atr_pct"],
+        "да" if market_regime["flags"]["news_event"] else "нет",
+    )
+    if market_regime["blocked"]:
+        reason = (
+            f"Режим рынка {market_regime['mode']} заблокирован явным правилом "
+            f"REGIME_BLOCKS. {market_regime['detail']}"
+        )
+        trade = {
+            "direction": decision["direction"], "reason": reason,
+            "blocked": True,
+        }
+        signal_id = log_signal(
+            trade, context, regime_info=market_regime, status="regime_blocked"
+        )
+        trade["direction"] = "WAIT"   # в чат — как отсутствие сигнала
+        return {
+            "kind": "wait",
+            "score": register_verdict("wait"),
+            "text": format_trade(trade),
+            "trade": trade,
+            "context": context,
+            "raw": "",
+            "signal_id": signal_id,
+        }
+
+    # Score 0–100: дополнительный порог отправки, НЕ замена конфлюэнции.
+    score_info = setup_score.score_setup(context, decision["direction"])
+    if not score_info["ok"]:
+        reason = (
+            f"Score-гейт: {score_info['reason']}.\n{decision['reason']}"
+        )
+        trade = {
+            "direction": decision["direction"], "reason": reason,
+            "blocked": True,
+        }
+        signal_id = log_signal(
+            trade, context, score_info=score_info, regime_info=market_regime,
+            status="score_blocked",
+        )
+        trade["direction"] = "WAIT"   # в чат — как отсутствие сигнала
+        return {
+            "kind": "wait",
+            "score": register_verdict("wait"),
+            "text": format_trade(trade),
+            "trade": trade,
+            "context": context,
+            "raw": "",
+            "signal_id": signal_id,
+        }
+
     if progress:
         await progress(
-            f"🧠 Подбираю уровни для {decision['direction']} через {GROQ_MODEL}..."
+            f"🧠 Подбираю вход для {decision['direction']} через {GROQ_MODEL}..."
         )
 
     try:
@@ -1017,12 +1237,50 @@ async def analyze(progress=None) -> dict:
         setup["direction"] = decision["direction"]
         setup["factors"] = decision["confirmed"]
         setup["required"] = decision["required"]
+
+        if setup["entry"] > 0:
+            # SL/TP считает система от структуры рынка — модель не растягивает
+            # цель ради R:R. Нет реальной цели с MIN_RR — это WAIT.
+            computed = levels.compute_levels(
+                direction=setup["direction"],
+                entry=setup["entry"],
+                price=context.get("price") or setup["entry"],
+                technicals=(context.get("blocks") or {}).get("technicals") or {},
+                walls=(context.get("blocks") or {}).get("orderbook", {}).get("walls"),
+                min_rr=MIN_RR,
+                min_stop_pct=min_stop_pct(BALANCE),
+                atr=context.get("blocks", {}).get("technicals", {}).get("15m", {}).get("atr14"),
+                regime=market_regime["mode"],
+            )
+            if "error" in computed:
+                trade = {
+                    "direction": "WAIT",
+                    "reason": f"Уровни: {computed['error']}",
+                }
+                log_signal(
+                    trade, context, score_info=score_info, regime_info=market_regime
+                )
+                return {
+                    "kind": "wait",
+                    "score": register_verdict("wait"),
+                    "text": format_trade(trade),
+                    "trade": trade,
+                    "context": context,
+                    "raw": raw,
+                }
+            setup["sl"], setup["tp"] = computed["sl"], computed["tp"]
+            setup["level_notes"] = computed.get("notes", "")
+
         trade = build_trade(
             setup, context["available"], BALANCE, context.get("price")
         )
         trade["votes"] = decision["reason"]
+        trade["score"] = score_info
+        trade["regime"] = market_regime
         if trade["direction"] == "WAIT":
             trade["reason"] = f"{trade['reason']}\n{decision['reason']}"
+        else:
+            attach_signal_meta(trade, context)
     except (ValueError, json.JSONDecodeError) as exc:
         log.warning("не удалось разобрать ответ модели: %s | raw=%s", exc, raw)
         trade = {"direction": "PARSE_ERROR", "reason": str(exc)}
@@ -1036,16 +1294,65 @@ async def analyze(progress=None) -> dict:
             "raw": raw,
         }
 
-    log_signal(trade, context, raw)
-    kind = "signal" if trade["direction"] in ("LONG", "SHORT") else "wait"
-    return {
-        "kind": kind,
-        "score": register_verdict(kind, trade["direction"]),
+    signal_id = log_signal(
+        trade, context, raw, score_info=score_info, regime_info=market_regime
+    )
+    result = {
+        "kind": "signal" if trade["direction"] in ("LONG", "SHORT") else "wait",
+        "score": 0,
         "text": format_trade(trade),
         "trade": trade,
         "context": context,
         "raw": raw,
+        "signal_id": signal_id,
     }
+    # TTL: сигнал действует до expires_at — после этого он уходит в
+    # журнал как expired и не отправляется (см. auto_check/paper entry).
+    # Проверка раньше register_verdict: истёкший сигнал не должен
+    # подтверждать направление в окне.
+    check_ttl(trade, result)
+    result["score"] = register_verdict(result["kind"], trade["direction"])
+    return result
+
+
+def attach_signal_meta(trade: dict, context: dict) -> None:
+    """Метаданные сигнала: TTL, снимок рынка, издержки — для журнала и чата."""
+    now = datetime.now().astimezone()
+    ttl = SIGNAL_TTL_SEC.get(TIMEFRAME, 900)
+    technicals = (context.get("blocks") or {}).get("technicals") or {}
+    trade["timeframe"] = TIMEFRAME
+    trade["formed_at"] = now.isoformat(timespec="seconds")
+    trade["expires_at"] = (now + timedelta(seconds=ttl)).isoformat(timespec="seconds")
+    trade["candle_close_at"] = context.get("candle_close_at")
+    trade["ttl_sec"] = ttl
+    # Снимок рынка на момент формирования — что видел бот, принимая решение.
+    frame = technicals.get("15m") or {}
+    trade["snapshot"] = {
+        "price": context.get("price"),
+        "atr_pct": context.get("atr_pct"),
+        "adx": frame.get("adx"),
+        "rsi14": frame.get("rsi14"),
+        "vol_ratio": frame.get("vol_ratio"),
+        "taker_flow": frame.get("taker_flow"),
+        "scores": context.get("scores"),
+        "available": context.get("available"),
+    }
+
+
+def check_ttl(trade: dict, result: dict) -> None:
+    """Истёкший сигнал помечается expired и не идёт в отправку/paper entry."""
+    expires = trade.get("expires_at")
+    if not expires:
+        return
+    if datetime.fromisoformat(expires) < datetime.now().astimezone():
+        trade["direction"] = "WAIT"
+        trade["reason"] = (
+            f"Сигнал истёк (TTL {trade['ttl_sec'] // 60} мин от "
+            f"{_stamp(trade['formed_at'])}) — отправлять поздно."
+        )
+        result["kind"] = "wait"
+        result["text"] = format_trade(trade)
+        signal_log.update_status(result.get("signal_id"), "expired", trade["reason"])
 
 
 @dp.message(Command("predict"))
@@ -1060,6 +1367,9 @@ async def predict_cmd(message: Message):
     if result["kind"] == "signal":
         # Пользователь уже увидел сигнал — фоновой задаче дублировать его не нужно.
         note_sent(result["trade"]["direction"])
+        signal_log.update_status(
+            result.get("signal_id"), "manual", "показан вручную по /predict"
+        )
     await safe_edit(msg, result["text"])
 
 
@@ -1104,12 +1414,23 @@ async def stats_cmd(message: Message):
             [
                 "📊 Статистика сигналов",
                 "",
-                f"Сделок (LONG/SHORT): {data['signals']}",
+                f"Сформировано (LONG/SHORT): {data['signals']}",
+                f"Отправлено: {data['sent']} · показано вручную: {data['manual']}",
+                f"Отменено: {data['cancelled']} · истекло (TTL): {data['expired']}",
+                f"Заблокировано: Score {data['score_blocked']}, "
+                f"режим {data['regime_blocked']}",
                 f"Пропущено (WAIT): {data['waits']}",
-                f"Суммарный профит: {usd(data['total_profit'] or 0)}",
-                f"Средний профит на сделку: {usd(data['avg_profit'] or 0)}",
+                "",
+                f"Плановая прибыль валовая (сумма оценок): {usd(data['total_profit'] or 0)}",
+                f"Средний план чистыми (за издержками, оценка): "
+                f"{usd(data['avg_net'] or 0)}",
+                f"Средний Score: {data['avg_score'] or 0:.0f}/100 "
+                "(сила сетапа, не вероятность)",
                 f"Средняя ширина стопа: {data['avg_stop']:.2f}%",
                 f"Средний R:R: {data['avg_rr']:.2f}",
+                "",
+                "⚠️ Плановые суммы — оценка на момент сигнала, НЕ результат.",
+                "Реальные цифры — только закрытые сделки ниже.",
             ]
         )
         + "\n"
@@ -1483,11 +1804,45 @@ async def auto_check() -> None:
     if same and recent:
         log.info("сигнал %s уже показан, не повторяю", direction)
         return
+
+    # Повторная проверка перед отправкой: подтверждение могло набраться
+    # за CONFIRM_WINDOW_SEC, а рынок с тех пор пошёл в другую сторону.
+    # Интервал настраивается (RECHECK_DELAY_SEC), по умолчанию короткий.
+    if RECHECK_DELAY_SEC > 0:
+        await asyncio.sleep(RECHECK_DELAY_SEC)
+        recheck_ok, recheck_reason = await recheck_signal(result)
+        if not recheck_ok:
+            # Отмена с причиной в журнал; подтверждение НЕ обходится —
+            # recheck только отменяет, никогда не отправляет без него.
+            log.warning("сигнал %s отменён повторной проверкой: %s",
+                        direction, recheck_reason)
+            signal_log.update_status(
+                result.get("signal_id"), "cancelled", recheck_reason
+            )
+            return
+
     note_sent(direction)
+    signal_log.update_status(
+        result.get("signal_id"), "sent",
+        "подтверждён и прошёл повторную проверку",
+        sent_at=signal_log.now_iso(),
+    )
     log.info(
         "сигнал %s подтверждён (%s за %s мин) — отправляю",
         direction, score, CONFIRM_WINDOW_SEC // 60,
     )
+    # TTL-проверка ещё раз перед самым входом: между recheck и ордером
+    # не должно пройти больше срока действия сигнала.
+    trade = result["trade"]
+    if trade.get("expires_at") and datetime.fromisoformat(
+        trade["expires_at"]
+    ) < datetime.now().astimezone():
+        signal_log.update_status(
+            result.get("signal_id"), "expired", "TTL истёк перед отправкой"
+        )
+        log.info("сигнал %s истёк по TTL перед отправкой — не шлю", direction)
+        return
+
     # Ордер ставится до отправки: если биржа отказалась, причина
     # попадает в то же сообщение, что и сигнал.
     paper_note = await place_paper_order(result["trade"])
@@ -1495,6 +1850,98 @@ async def auto_check() -> None:
         result["text"] + (f"\n\n{paper_note}" if paper_note else ""),
         keyboard=CLOSE_BUTTONS if paper_note.startswith("📋") else None,
     )
+
+
+async def recheck_signal(result: dict) -> tuple:
+    """Повторная проверка перед отправкой. (True, "") или (False, причина).
+
+    Собирает рыночные данные заново и проверяет, что решение ещё верно:
+      * нужные источники живы (не меньше REQUIRED_FACTORS);
+      * направление конфлюэнции не изменилось;
+      * цена не ушла дальше MAX_ENTRY_DRIFT от входа;
+      * уровни всё ещё дают MIN_RR (цель могла стать недостижимой);
+      * Risk Engine снова даёт тот же сигнал, не WAIT;
+      * данные свежие (не старше RECHECK_MAX_AGE_SEC).
+
+    Не прошёл — сигнал не отправляется. Ничего не отправляет и не
+    подтверждает: только возвращает причину отмены.
+    """
+    trade = result["trade"]
+    try:
+        context = await build_market_context(SYMBOL)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"повторная проверка: данные недоступны ({exc})"
+
+    if len(context["available"]) < REQUIRED_FACTORS:
+        return False, (
+            "повторная проверка: источников стало меньше "
+            f"({', '.join(context['available']) or 'нет'}) — сигнал отменён"
+        )
+
+    fetched = context.get("fetched_at")
+    if fetched:
+        age = (datetime.now().astimezone() - datetime.fromisoformat(fetched)).total_seconds()
+        if age > RECHECK_MAX_AGE_SEC:
+            return False, (
+                f"повторная проверка: данные старше {RECHECK_MAX_AGE_SEC:g} с "
+                f"({age:.0f} с) — решение принималось по устаревшим данным"
+            )
+
+    decision = decide_direction(context)
+    if decision["direction"] != trade["direction"]:
+        return False, (
+            f"повторная проверка: направление изменилось "
+            f"{trade['direction']} → {decision['direction']} ({decision['reason']})"
+        )
+
+    price = context.get("price")
+    if price and abs(price - trade["entry"]) / trade["entry"] > MAX_ENTRY_DRIFT:
+        return False, (
+            f"повторная проверка: цена ушла на "
+            f"{abs(price - trade['entry']) / trade['entry'] * 100:.2f}% от входа "
+            f"(лимит {MAX_ENTRY_DRIFT * 100:g}%)"
+        )
+
+    market_regime = regime.detect(context)
+    if market_regime["blocked"]:
+        return False, (
+            f"повторная проверка: режим {market_regime['mode']} заблокирован "
+            "правилом REGIME_BLOCKS"
+        )
+
+    computed = levels.compute_levels(
+        direction=trade["direction"],
+        entry=trade["entry"],
+        price=price or trade["entry"],
+        technicals=(context.get("blocks") or {}).get("technicals") or {},
+        walls=(context.get("blocks") or {}).get("orderbook", {}).get("walls"),
+        min_rr=MIN_RR,
+        min_stop_pct=min_stop_pct(BALANCE),
+        atr=(context.get("blocks") or {}).get("technicals", {}).get("15m", {}).get("atr14"),
+        regime=market_regime["mode"],
+    )
+    if "error" in computed:
+        return False, f"повторная проверка: уровни ({computed['error']})"
+
+    score_info = setup_score.score_setup(context, trade["direction"])
+    if not score_info["ok"]:
+        return False, f"повторная проверка: {score_info['reason']}"
+
+    fresh = dict(trade, sl=computed["sl"], tp=computed["tp"])
+    rebuilt = build_trade(
+        {**fresh, "factors": decision["confirmed"], "required": decision["required"],
+         "atr_pct": context["atr_pct"]},
+        context["available"], BALANCE, price,
+    )
+    if rebuilt["direction"] != trade["direction"]:
+        return False, f"повторная проверка: Risk Engine ({rebuilt['reason']})"
+
+    log.info(
+        "повторная проверка пройдена: %s, цена %s → %s, уровни sl %s → %s, tp %s → %s",
+        trade["direction"], trade["entry"], price,
+        trade["sl"], computed["sl"], trade["tp"], computed["tp"],
+    )
+    return True, ""
 
 
 def next_check_delay() -> float:

@@ -20,7 +20,9 @@ MEXC_SPOT / OKX — так удобно эмулировать блокиров�
 
 import asyncio
 import os
+import time
 import xml.etree.ElementTree as ET
+from datetime import datetime
 
 import aiohttp
 
@@ -47,6 +49,10 @@ INTERVALS = {
     "mexc": {"15m": "15m", "1h": "60m"},
     "okx": {"15m": "15m", "1h": "1H"},
 }
+
+# Длительность интервала в миллисекундах — чтобы знать, закрыта ли свеча
+# и когда именно она закрылась (TTL сигнала, запрет будущих данных).
+INTERVAL_MS = {"15m": 900_000, "1h": 3_600_000}
 
 
 async def _get_json(session, url, params=None):
@@ -138,6 +144,117 @@ def _atr(highs, lows, closes, period=14):
     for value in true_ranges[period:]:
         result = (result * (period - 1) + value) / period
     return result
+
+
+def _adx(highs, lows, closes, period=14):
+    """ADX по Уайлдеру: сила тренда независимо от направления (0–100+).
+
+    Нужен режиму рынка: ADX выше порога — тренд, ниже — боковик.
+    Считается по закрытым свечам; сглаждение — стандартное Уайлдера
+    (предыдущее значение × (n-1) + текущее) / n.
+    """
+    if len(closes) < period * 2 + 1:
+        return None
+    plus_dm, minus_dm, trs = [], [], []
+    for i in range(1, len(closes)):
+        up, down = highs[i] - highs[i - 1], lows[i - 1] - lows[i]
+        plus_dm.append(up if (up > down and up > 0) else 0.0)
+        minus_dm.append(down if (down > up and down > 0) else 0.0)
+        trs.append(
+            max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+        )
+
+    def wilder_smooth(values):
+        result = [sum(values[:period]) / period]
+        for value in values[period:]:
+            result.append((result[-1] * (period - 1) + value) / period)
+        return result
+
+    atr_s = wilder_smooth(trs)
+    plus_s = wilder_smooth(plus_dm)
+    minus_s = wilder_smooth(minus_dm)
+
+    dxs = []
+    for a, p, m in zip(atr_s, plus_s, minus_s):
+        if a <= 0:
+            dxs.append(0.0)
+            continue
+        plus_di = 100 * p / a
+        minus_di = 100 * m / a
+        denom = plus_di + minus_di
+        dxs.append(100 * abs(plus_di - minus_di) / denom if denom else 0.0)
+
+    # ADX = сглаждённый DX; первое значение — среднее первых period DX.
+    adx = sum(dxs[:period]) / period
+    for value in dxs[period:]:
+        adx = (adx * (period - 1) + value) / period
+    return round(adx, 2)
+
+
+def _swings(highs, lows, window=3):
+    """Подтверждённые экстремумы (pivot high/low) по закрытым свечам.
+
+    Свеча — swing high, если её максимум строго выше максимумов ±window
+    свечей. Правая часть окна обязательна: без неё экстремум ещё не
+    подтверждён и мог бы «перерисоваться» — это и есть запрет
+    использования будущих данных.
+    """
+    swing_highs, swing_lows = [], []
+    for i in range(window, len(highs) - window):
+        seg_h = highs[i - window : i + window + 1]
+        seg_l = lows[i - window : i + window + 1]
+        if highs[i] == max(seg_h) and seg_h.count(highs[i]) == 1:
+            swing_highs.append((i, highs[i]))
+        if lows[i] == min(seg_l) and seg_l.count(lows[i]) == 1:
+            swing_lows.append((i, lows[i]))
+    return swing_highs, swing_lows
+
+
+def _levels(swing_pairs, price, atr, cluster_pct=0.15, max_levels=4):
+    """Ближайшие уровни поддержки/сопротивления из свайпов.
+
+    Свайпы кластеризуются по цене (в пределах cluster_pct от ATR — чтобы
+    два пика на одной высоте считались одним уровнем с числом касаний),
+    затем отбираются ближайшие к текущей цене: support — ниже цены,
+    resistance — выше. Возвращает dict с lists [{"price", "touches"}].
+    """
+    swing_highs, swing_lows = swing_pairs
+    tol = (atr * cluster_pct) if atr else price * 0.001
+
+    def cluster(swings):
+        levels = []
+        for _, p in sorted(swings, key=lambda s: s[1]):
+            for level in levels:
+                if abs(level["price"] - p) <= tol:
+                    # Среднее по кластеру — опорная цена уровня.
+                    level["price"] = (
+                        level["price"] * level["touches"] + p
+                    ) / (level["touches"] + 1)
+                    level["touches"] += 1
+                    break
+            else:
+                levels.append({"price": p, "touches": 1})
+        return levels
+
+    supports = sorted(
+        (l for l in cluster(swing_lows) if l["price"] < price),
+        key=lambda l: -l["price"],
+    )[:max_levels]
+    resistances = sorted(
+        (l for l in cluster(swing_highs) if l["price"] > price),
+        key=lambda l: l["price"],
+    )[:max_levels]
+    return {
+        "support": [{"price": round(l["price"], 2), "touches": l["touches"]} for l in supports],
+        "resistance": [
+            {"price": round(l["price"], 2), "touches": l["touches"]}
+            for l in resistances
+        ],
+    }
 
 
 # --- Стакан ---------------------------------------------------------------
@@ -374,7 +491,13 @@ async def get_derivatives(session, symbol):
 # --- Свечи и индикаторы ---------------------------------------------------
 
 def _spot_klines(base, intervals):
-    """Binance и MEXC отдают свечи одинаково, различается только интервал."""
+    """Binance и MEXC отдают свечи одинаково, различается только интервал.
+
+    Свеча: (high, low, close, volume, taker_buy, open_time_ms). taker_buy
+    (доля покупателя по рыночным ордерам) есть только у Binance (r[9]) —
+    это прокси order flow; если колонки нет, ставим None, а не ноль,
+    чтобы группа факторов не получила выдуманные данные.
+    """
 
     async def fetch(session, symbol, interval, limit):
         data = await _get_json(
@@ -382,7 +505,17 @@ def _spot_klines(base, intervals):
             f"{base}/api/v3/klines",
             {"symbol": symbol, "interval": intervals[interval], "limit": limit},
         )
-        return {"candles": [(float(r[2]), float(r[3]), float(r[4])) for r in data]}
+        return {
+            "candles": [
+                (
+                    float(r[2]), float(r[3]), float(r[4]),
+                    float(r[5]),
+                    float(r[9]) if len(r) > 9 and r[9] else None,
+                    int(r[0]),
+                )
+                for r in data
+            ]
+        }
 
     return fetch
 
@@ -403,7 +536,12 @@ async def _bybit_klines(session, symbol, interval, limit):
         raise ValueError("Bybit не вернул свечи")
     # Bybit отдаёт новые свечи первыми — разворачиваем в хронологический порядок.
     rows = list(reversed(rows))
-    return {"candles": [(float(r[2]), float(r[3]), float(r[4])) for r in rows]}
+    return {
+        "candles": [
+            (float(r[2]), float(r[3]), float(r[4]), float(r[5]), None, int(r[0]))
+            for r in rows
+        ]
+    }
 
 
 async def _okx_klines(session, symbol, interval, limit):
@@ -421,7 +559,12 @@ async def _okx_klines(session, symbol, interval, limit):
         raise ValueError("OKX не вернул свечи")
     # OKX тоже отдаёт новые свечи первыми.
     rows = list(reversed(rows))
-    return {"candles": [(float(r[2]), float(r[3]), float(r[4])) for r in rows]}
+    return {
+        "candles": [
+            (float(r[2]), float(r[3]), float(r[4]), float(r[5]), None, int(r[0]))
+            for r in rows
+        ]
+    }
 
 
 BINANCE_KLINES = _spot_klines(BINANCE_SPOT, INTERVALS["binance"])
@@ -429,8 +572,19 @@ MEXC_KLINES = _spot_klines(MEXC_SPOT, INTERVALS["mexc"])
 
 
 async def get_indicators(session, symbol, limit=KLINE_LIMIT):
-    """EMA 20/50/200, RSI(14), ATR(14) на 15m и 1h. Считается локально."""
+    """EMA 20/50/200, RSI(14), ATR(14), ADX(14), объём и структура рынка.
+
+    Индикаторы считаются ТОЛЬКО по закрытым свечам: формирующаяся свеча
+    не имеет финальных значений — считать по ней значит смотреть в
+    будущее. Текущая цена берётся отдельно (это рыночная цена на момент
+    запроса, а не «закрытие», которое ещё не наступило).
+
+    Точка входа для уровней: свайпы (подтверждённые экстремумы),
+    кластеризованные в уровни поддержки/сопротивления, и ADX — сила
+    тренда для режима рынка.
+    """
     out, failures = {}, {}
+    now_ms = time.time() * 1000
 
     for interval in ("15m", "1h"):
         data = await _with_fallback(
@@ -445,23 +599,76 @@ async def get_indicators(session, symbol, limit=KLINE_LIMIT):
             failures[interval] = data["error"]
             continue
 
-        highs = [c[0] for c in data["candles"]]
-        lows = [c[1] for c in data["candles"]]
-        closes = [c[2] for c in data["candles"]]
-        if len(closes) < 200:
-            failures[interval] = f"{data['source']}: свечей всего {len(closes)}, нужно 200"
+        candles = data["candles"]
+        bar_ms = INTERVAL_MS[interval]
+        last_open = candles[-1][5]
+        forming = now_ms < last_open + bar_ms
+        # Формирующаяся свеча отбрасывается: её значения — это будущее.
+        closed = candles[:-1] if forming else candles
+        if len(closed) < 200:
+            failures[interval] = (
+                f"{data['source']}: закрытых свечей всего {len(closed)}, нужно 200"
+            )
             continue
 
+        highs = [c[0] for c in closed]
+        lows = [c[1] for c in closed]
+        closes = [c[2] for c in closed]
+        volumes = [c[3] for c in closed]
+        takers = [c[4] for c in closed]
+
         atr = _atr(highs, lows, closes, 14)
+        swing_highs, swing_lows = _swings(highs, lows)
+        swing_high_prices = [round(p, 2) for _, p in swing_highs]
+        swing_low_prices = [round(p, 2) for _, p in swing_lows]
+
+        # Относительный объём последней закрытой свечи к среднему за 20.
+        recent_vol = sum(volumes[-20:]) / 20
+        vol_ratio = round(volumes[-1] / recent_vol, 2) if recent_vol else None
+
+        # Доля покупателя в market-ордерах (тейкер-флоу) — прокси CVD.
+        # Есть только у Binance: у остальных колонки нет, ставим None,
+        # чтобы группа «Order Flow» не получила выдуманные нули.
+        taker_flow = None
+        tail_takers = takers[-20:]
+        tail_volumes = volumes[-20:]
+        if all(t is not None for t in tail_takers):
+            total = sum(tail_volumes)
+            if total > 0:
+                taker_flow = round(sum(tail_takers) / total, 3)
+
+        # Время закрытия последней ЗАКРЫТОЙ свечи: у формирующейся это её
+        # время открытия, иначе — открытие плюс длительность интервала.
+        close_ms = last_open if forming else last_open + bar_ms
+        candle_close_at = datetime.fromtimestamp(
+            close_ms / 1000
+        ).astimezone().isoformat(timespec="seconds")
+
         out[interval] = {
             "source": data["source"],
             "close": closes[-1],
+            # Текущая цена — формирующаяся свеча, если она есть: это
+            # рыночная цена запроса, а не заявленное закрытие.
+            "price": candles[-1][2] if forming else closes[-1],
+            "forming": forming,
+            "candle_close_at": candle_close_at,
             "ema20": _ema(closes, 20),
             "ema50": _ema(closes, 50),
             "ema200": _ema(closes, 200),
             "rsi14": _rsi(closes, 14),
             "atr14": atr,
             "atr_pct": round(atr / closes[-1] * 100, 3) if atr else None,
+            "adx": _adx(highs, lows, closes, 14),
+            "swing_highs": swing_high_prices,
+            "swing_lows": swing_low_prices,
+            "levels": _levels(
+                (swing_highs, swing_lows), closes[-1], atr
+            ),
+            "range_low": round(min(lows[-60:]), 2),
+            "range_high": round(max(highs[-60:]), 2),
+            "vol_ratio": vol_ratio,
+            "taker_flow": taker_flow,
+            "closes_20": closes[-20],
         }
 
     if not out:
@@ -717,8 +924,38 @@ async def build_market_context(symbol="BTC/USDT"):
                 f"EMA20 {_fmt(block['ema20'])} | EMA50 {_fmt(block['ema50'])} | "
                 f"EMA200 {_fmt(block['ema200'])} | "
                 f"RSI {_fmt(block['rsi14'], 1)} | "
-                f"ATR {_fmt(block['atr14'])} ({_fmt(block['atr_pct'], 3)}%)"
+                f"ATR {_fmt(block['atr14'])} ({_fmt(block['atr_pct'], 3)}%) | "
+                f"ADX {_fmt(block.get('adx'), 1)}"
             )
+            levels = block.get("levels") or {}
+            if levels.get("support") or levels.get("resistance"):
+                sup = ", ".join(
+                    f"{l['price']:,.0f}({l['touches']})" for l in levels.get("support", [])
+                ) or "нет"
+                res = ", ".join(
+                    f"{l['price']:,.0f}({l['touches']})" for l in levels.get("resistance", [])
+                ) or "нет"
+                lines.append(
+                    f"  уровни поддержка: {sup} | сопротивление: {res} "
+                    "(в скобках касания)"
+                )
+                lines.append(
+                    f"  диапазон 60 свечей: {_fmt(block.get('range_low'))} – "
+                    f"{_fmt(block.get('range_high'))}"
+                )
+            vol = block.get("vol_ratio")
+            if vol is not None:
+                lines.append(f"  объём последней свечи к среднему за 20: ×{vol}")
+            flow = block.get("taker_flow")
+            if flow is not None:
+                lines.append(
+                    f"  доля покупателя в market-ордерах (20 свечей): {flow:.1%}"
+                )
+            if block.get("forming"):
+                lines.append(
+                    f"  последняя свеча ещё формируется, закрытие: "
+                    f"{block.get('candle_close_at', 'н/д')}"
+                )
     else:
         lines.append(f"unavailable: {errors.get('technicals', '')}")
     lines.append("")
@@ -741,14 +978,20 @@ async def build_market_context(symbol="BTC/USDT"):
 
     atr_pct = None
     price = None
+    candle_close_at = None
     if "technicals" in available:
         technicals = blocks["technicals"]
         atr_pct = technicals.get("15m", {}).get("atr_pct")
         if atr_pct is None:
             atr_pct = technicals.get("1h", {}).get("atr_pct")
-        price = technicals.get("15m", {}).get("close")
+        # Цена запроса (формирующаяся свеча), а не «закрытие», которое
+        # ещё не наступило: дрейф entry считается от реального рынка.
+        price = technicals.get("15m", {}).get("price")
         if price is None:
-            price = technicals.get("1h", {}).get("close")
+            price = technicals.get("1h", {}).get("price")
+        candle_close_at = technicals.get("15m", {}).get("candle_close_at")
+        if candle_close_at is None:
+            candle_close_at = technicals.get("1h", {}).get("candle_close_at")
 
     return {
         "text": "\n".join(lines),
@@ -757,4 +1000,11 @@ async def build_market_context(symbol="BTC/USDT"):
         "price": price,
         "scores": scores,
         "errors": errors,
+        # Снимок блоков — для уровней, режима рынка и Score: всё считается
+        # из этих же данных, ничего не перезапрашивается и не пересчитывается
+        # по изменённой цене (исторический снимок остаётся как был).
+        "blocks": blocks,
+        "candle_close_at": candle_close_at,
+        "fetched_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "timeframe": "15m",
     }
