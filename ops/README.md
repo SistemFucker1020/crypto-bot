@@ -270,7 +270,7 @@ OKX_KEY=... OKX_SECRET=... OKX_PASSPHRASE=... \
 | `SIGNAL_TTL_15M` / `SIGNAL_TTL_1H` | `1800` / `7200` | срок действия сигнала, сек (по таймфрейму) |
 | `RECHECK_DELAY_SEC` | `10` | пауза перед повторной проверкой; `0` — выключить |
 | `RECHECK_MAX_AGE_SEC` | `120` | данные старше — повторная проверка отменяет сигнал |
-| `SCORE_MIN` | `60` | минимальный Score для отправки (0–100) |
+| `SCORE_MIN` | `50` | минимальный Score для отправки (0–100) |
 | `SCORE_MIN_COVERAGE` | `0.6` | минимальное покрытие данных групп Score |
 | `SCORE_W_STRUCTURE` / `_ORDERFLOW` / `_OI` / `_LIQ` / `_VOLUME` / `_HTF` / `_BOOK` | `20/15/15/10/10/15/15` | веса групп Score (сумма 100) |
 | `REGIME_BLOCKS` | пусто | режимы, блокирующие сигнал, напр. `HIGH_VOLATILITY,NEWS_EVENT` |
